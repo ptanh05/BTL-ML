@@ -1,0 +1,2 @@
+# Large local dataset archives must not be committed to Git.
+Dataset_Split-*.zip

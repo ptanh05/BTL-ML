@@ -1,0 +1,34 @@
+# Runtime target: Python 3.12
+#
+# PyTorch and torchvision are pinned as an officially matched pair. On a
+# local NVIDIA machine, install the matching CUDA wheel from pytorch.org
+# before installing this file. Google Colab normally provides a CUDA-enabled
+# build already; these pins keep all team environments reproducible.
+
+# Deep learning
+torch==2.13.0
+torchvision==0.28.0
+
+# Numerical computing and image pipeline
+numpy>=2.0,<3
+opencv-python-headless>=4.10,<5
+Pillow>=10.4,<13
+albumentations>=2.0.8,<3
+
+# Dataset, annotations, configuration, and Google Drive downloads
+PyYAML>=6.0.2,<7
+lxml>=5.3,<7
+gdown>=5.2,<6
+
+# Evaluation, experiment tables, plots, and training logs
+pycocotools>=2.0.11,<3
+scikit-learn>=1.5,<2
+pandas>=2.2,<4
+matplotlib>=3.9,<4
+seaborn>=0.13.2,<1
+tensorboard>=2.18,<3
+tqdm>=4.66,<5
+
+# Model inspection and automated tests
+torchinfo>=1.8,<2
+pytest>=8.3,<10
