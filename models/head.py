@@ -25,7 +25,6 @@ if str(ROOT) not in sys.path:
 import torch
 import torch.nn as nn
 from typing import List, Tuple
-from models.common import conv3x3
 
 
 class YOLOHead(nn.Module):
@@ -44,20 +43,36 @@ class YOLOHead(nn.Module):
         self.num_classes = num_classes
         self.num_anchors = num_anchors
         self.out_channels = num_anchors * (5 + num_classes)  # = 21
-
-        self.heads = nn.ModuleList([
-            nn.Sequential(
-                conv3x3(c, 2 * c, stride=1, dsc=dsc),
-                nn.Conv2d(2 * c, self.out_channels, kernel_size=1)
-            )
-            for c in in_channels
-        ])
+        # TODO: Tú khởi tạo nn.ModuleList chứa các nhánh conv3x3 và conv 1x1
+        raise NotImplementedError("Cần được Tú (Loss & Head Developer) cài đặt YOLOHead.")
 
     def forward(self, *feats: torch.Tensor) -> List[torch.Tensor]:
         """
         Nhận 3 feature maps (từ Neck), trả về 3 tensor dự đoán có kênh = 21.
         """
-        return [head(f) for head, f in zip(self.heads, feats)]
+        raise NotImplementedError("Cần được Tú cài đặt forward của YOLOHead.")
+
+
+def decode_box_predictions(
+    predictions: List[torch.Tensor],
+    anchors: torch.Tensor,
+    strides: List[int] = [8, 16, 32]
+) -> torch.Tensor:
+    """
+    Giải mã dự đoán thô từ head thành bounding boxes chuẩn hóa [cx, cy, w, h] hoặc [x1, y1, x2, y2].
+    """
+    raise NotImplementedError("Cần được Tú cài đặt decode_box_predictions.")
+
+
+def non_max_suppression(
+    prediction: torch.Tensor,
+    conf_thres: float = 0.25,
+    iou_thres: float = 0.45
+) -> List[torch.Tensor]:
+    """
+    Thực hiện NMS loại bỏ các hộp bao trùng lặp dựa trên IoU threshold.
+    """
+    raise NotImplementedError("Cần được Tú cài đặt non_max_suppression.")
 
 
 if __name__ == "__main__":
@@ -65,24 +80,4 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
-
-    print(">> [Unit Test] Running models/head.py...")
-    # Thử nghiệm với đầu ra của PBModule (128, 128, 128)
-    head = YOLOHead(in_channels=(128, 128, 128), num_classes=2, num_anchors=3, dsc=True)
-
-    f3 = torch.randn(2, 128, 76, 76)
-    f4 = torch.randn(2, 128, 38, 38)
-    f5 = torch.randn(2, 128, 19, 19)
-
-    outs = head(f3, f4, f5)
-    assert [tuple(o.shape) for o in outs] == [
-        (2, 21, 76, 76),
-        (2, 21, 38, 38),
-        (2, 21, 19, 19)
-    ], f"Lỗi shape YOLOHead: {[o.shape for o in outs]}"
-    print(">> [Unit Test] YOLOHead Output Shapes (21 channels): PASS!")
-
-    loss = sum(o.mean() for o in outs)
-    loss.backward()
-    print(">> [Unit Test] Backward Gradient Test: PASS!")
-    print(">> Unit Test models/head.py: ALL PASS! [DoD M2]")
+    print(">> [TODO] models/head.py: Tú cần hoàn thiện YOLOHead và hàm decode để vượt qua Unit Test.")
