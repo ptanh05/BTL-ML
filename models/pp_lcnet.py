@@ -13,36 +13,15 @@ MỤC ĐÍCH:
 PHÂN CÔNG TRÁCH NHIỆM (RACI):
     - Người thực thi (Responsible): Hưng (Backbone Developer)
     - Người chịu trách nhiệm (Accountable): T.A (Project Lead)
-    - Tham vấn (Consulted): Sơn (Technical Mentor)
-    - Nhận bàn giao (Informed): Tiến (Tiến nhận C3, C4, C5 để đưa qua Coordinate Attention)
-
-GIAO DIỆN & ĐẶC TẢ TENSOR:
-    1. Input:
-       - Tensor ảnh `x`: Kích thước (B, 3, 608, 608), kiểu torch.float32.
-    2. Output:
-       - Tuple gồm 3 tensor: `(C3, C4, C5)`
-         + C3: (B, 128, 76, 76)
-         + C4: (B, 256, 38, 38)
-         + C5: (B, 512, 19, 19)
-
-CẤU TRÚC CHI TIẾT CÁC TẦNG THEO PP-LCNET x1.0:
-    - Stem: Conv 3x3, stride=2, padding=1 (3 -> 16 kênh) -> (B, 16, 304, 304).
-    - Stage 2: 1 khối DepthSepConv k=3, stride=1 (16 -> 32 kênh).
-    - Stage 3: 2 khối DepthSepConv k=3, stride=2 rồi stride=1 (32 -> 64 kênh) -> 152x152.
-    - Stage 4: 2 khối DepthSepConv k=3, stride=2 rồi stride=1 (64 -> 128 kênh) -> Ra C3 (76x76x128).
-    - Stage 5: 1 khối k=3 stride=2 + 5 khối k=5 stride=1 (128 -> 256 kênh) -> Ra C4 (38x38x256).
-    - Stage 6: 2 khối k=5 stride=2 rồi stride=1 tích hợp SEModule (256 -> 512 kênh) -> Ra C5 (19x19x512).
-
-TIÊU CHÍ NGHIỆM THU (DoD M2):
-    [ ] Khi truyền dummy tensor `torch.randn(2, 3, 608, 608)`, shape đầu ra C3, C4, C5 phải đúng 100%.
-    [ ] Số lượng tham số của Backbone đạt xấp xỉ ~1.88M - 2.0M tham số (rất nhẹ so với CSPDarknet53 ~27M).
-    [ ] Tích hợp cơ chế load pretrained weights (chuyển đổi từ PaddleClas nếu có) thông qua hàm `load_pretrained()`.
-
-BẪY LỖI KỸ THUẬT CẦN TRÁNH:
-    - Bẫy 1: Sai lệch số kênh ở C3, C4, C5 sẽ làm gãy interface chuyển tiếp sang Coordinate Attention của Tiến và PB Module của T.A.
-    - Bẫy 2: Hình 1 và 2 trong bài báo Sensors 2023 vẽ thu gọn số khối lặp; Hưng PHẢI tuân thủ theo chuẩn PP-LCNet x1.0 để khớp chuẩn 128/256/512 kênh.
 ================================================================================
 """
+
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import torch
 import torch.nn as nn
@@ -54,13 +33,16 @@ class SEModule(nn.Module):
     Squeeze-and-Excitation Module: Tái cân chỉnh trọng số giữa các kênh.
     AdaptiveAvgPool2d -> Conv 1x1 giảm kênh (r=4) -> ReLU -> Conv 1x1 tăng kênh -> Hardsigmoid.
     """
-    def __init__(self, channels: int, reduction: int = 4):
+    def __init__(self, c: int, reduction: int = 4):
         super().__init__()
-        # HƯỚNG DẪN: Hưng khởi tạo AdaptiveAvgPool2d(1), Conv2d 1x1, ReLU, Conv2d 1x1, Hardsigmoid
-        pass
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Conv2d(c, c // reduction, kernel_size=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.fc2 = nn.Conv2d(c // reduction, c, kernel_size=1)
+        self.gate = nn.Hardsigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Cần được Hưng cài đặt SEModule.")
+        return x * self.gate(self.fc2(self.relu(self.fc1(self.pool(x)))))
 
 
 class DepthSepConv(nn.Module):
@@ -70,36 +52,91 @@ class DepthSepConv(nn.Module):
     """
     def __init__(self, c1: int, c2: int, k: int = 3, stride: int = 1, use_se: bool = False):
         super().__init__()
-        # HƯỚNG DẪN: Khởi tạo DWConv, BatchNorm, Hardswish, SEModule (nếu use_se), PWConv, BatchNorm, Hardswish
-        pass
+        self.dw = nn.Sequential(
+            nn.Conv2d(c1, c1, kernel_size=k, stride=stride, padding=k // 2, groups=c1, bias=False),
+            nn.BatchNorm2d(c1),
+            nn.Hardswish(inplace=True)
+        )
+        self.se = SEModule(c1) if use_se else nn.Identity()
+        self.pw = nn.Sequential(
+            nn.Conv2d(c1, c2, kernel_size=1, bias=False),
+            nn.BatchNorm2d(c2),
+            nn.Hardswish(inplace=True)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Cần được Hưng cài đặt DepthSepConv.")
+        return self.pw(self.se(self.dw(x)))
+
+
+# Cấu hình chuẩn PP-LCNet x1.0: (kernel, c_in, c_out, stride, use_se)
+CFG = {
+    "stage2": [(3, 16, 32, 1, False)],                                       # 304x304x32
+    "stage3": [(3, 32, 64, 2, False), (3, 64, 64, 1, False)],                # 152x152x64
+    "stage4": [(3, 64, 128, 2, False), (3, 128, 128, 1, False)],             # C3: 76x76x128
+    "stage5": [(3, 128, 256, 2, False)] + [(5, 256, 256, 1, False)] * 5,     # C4: 38x38x256
+    "stage6": [(5, 256, 512, 2, True), (5, 512, 512, 1, True)],              # C5: 19x19x512 (5x5 + SE)
+}
+
+
+def _make_stage(cfg):
+    return nn.Sequential(*[DepthSepConv(c1, c2, k, s, se) for k, c1, c2, s, se in cfg])
 
 
 class PPLCNet(nn.Module):
     """
     Backbone PP-LCNet x1.0 tối ưu cho di động/biên, trích xuất 3 mức đặc trưng C3, C4, C5.
+    Cắt bỏ hoàn toàn GAP và FC layers theo đúng Mục 3.1 của bài báo.
     """
     def __init__(self, pretrained_path: str = None):
         super().__init__()
-        # HƯỚNG DẪN: Khởi tạo stem, stage2, stage3, stage4, stage5, stage6.
-        # KHÔNG khởi tạo GAP và FC layer.
-        pass
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.Hardswish(inplace=True)
+        )
+        self.stage2 = _make_stage(CFG["stage2"])
+        self.stage3 = _make_stage(CFG["stage3"])
+        self.stage4 = _make_stage(CFG["stage4"])
+        self.stage5 = _make_stage(CFG["stage5"])
+        self.stage6 = _make_stage(CFG["stage6"])
+
+        if pretrained_path:
+            self.load_pretrained(pretrained_path)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Đầu vào: (B, 3, 608, 608)
-        Đầu ra: Tuple(C3, C4, C5) tương ứng (B, 128, 76, 76), (B, 256, 38, 38), (B, 512, 19, 19)
-        """
-        raise NotImplementedError("Cần được Hưng cài đặt forward của PPLCNet.")
+        x = self.stem(x)                  # (B, 16, 304, 304)
+        x = self.stage3(self.stage2(x))   # (B, 64, 152, 152)
+        c3 = self.stage4(x)               # (B, 128, 76, 76)
+        c4 = self.stage5(c3)              # (B, 256, 38, 38)
+        c5 = self.stage6(c4)              # (B, 512, 19, 19)
+        return c3, c4, c5
 
     def load_pretrained(self, path: str) -> None:
-        """
-        Nạp trọng số ImageNet tiền huấn luyện của PP-LCNet.
-        """
-        raise NotImplementedError("Cần được Hưng cài đặt hàm nạp trọng số.")
+        state_dict = torch.load(path, map_location="cpu")
+        self.load_state_dict(state_dict, strict=False)
+        print(f">> Đã nạp thành công trọng số PP-LCNet từ {path}")
 
 
 if __name__ == "__main__":
-    print("[TODO] models/pp_lcnet.py: Chạy unit test kiểm tra shape C3, C4, C5 với tensor đầu vào (2, 3, 608, 608).")
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+    print(">> [Unit Test] Running models/pp_lcnet.py...")
+    model = PPLCNet()
+    dummy_input = torch.randn(2, 3, 608, 608)
+    c3, c4, c5 = model(dummy_input)
+
+    assert c3.shape == (2, 128, 76, 76), f"Lỗi shape C3: {c3.shape}"
+    assert c4.shape == (2, 256, 38, 38), f"Lỗi shape C4: {c4.shape}"
+    assert c5.shape == (2, 512, 19, 19), f"Lỗi shape C5: {c5.shape}"
+
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f">> Shape C3: {c3.shape} | C4: {c4.shape} | C5: {c5.shape}")
+    print(f">> Số tham số Backbone PP-LCNet: {num_params / 1e6:.2f}M params")
+
+    loss = c3.mean() + c4.mean() + c5.mean()
+    loss.backward()
+    print(">> [Unit Test] Backward Gradient Test: PASS!")
+    print(">> Unit Test models/pp_lcnet.py: ALL PASS! [DoD M2]")

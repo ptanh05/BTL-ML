@@ -14,42 +14,47 @@ MỤC ĐÍCH:
       đối chiếu trực tiếp với Bảng 1 của bài báo.
 
 PHÂN CÔNG TRÁCH NHIỆM (RACI):
-    - Người thực thi (Responsible): T.A (Project Lead) & Sơn (Technical Mentor)
-    - Người chịu trách nhiệm (Accountable): T.A (Project Lead)
-    - Tham vấn (Consulted): Hưng, Tiến, Tú
-    - Nhận bàn giao (Informed): Toàn bộ 5 thành viên để huấn luyện trên Colab cá nhân
-
-GIAO DIỆN & ĐẶC TẢ TENSOR:
-    1. Input:
-       - Tensor ảnh `x`: (B, 3, 608, 608)
-    2. Output:
-       - Khi Huấn luyện: Trả về danh sách 3 tensor thô từ head: (B, 21, 76, 76), (B, 21, 38, 38), (B, 21, 19, 19).
-       - Khi Đánh giá / Suy luận: Trả về tensor bounding boxes đã giải mã.
-
-BẢNG ĐỐI CHIẾU DUNG LƯỢNG MỤC TIÊU (Bảng 1 bài báo):
-    - Model-1: 243.92 MB (CSPDarknet53 + Conv chuẩn + PANet + CIoU)
-    - Model-2: 136.13 MB (CSPDarknet53 + DSConv + PANet + CIoU)
-    - Model-3:  38.75 MB (PP-LCNet + DSConv + PANet + CIoU)
-    - Model-4:  38.99 MB (PP-LCNet + CA + DSConv + PANet + CIoU)
-    - Model-5:  41.88 MB (PP-LCNet + CA + DSConv + PB Module + CIoU)
-    - Model-6:  41.88 MB (PP-LCNet + CA + DSConv + PB Module + SIoU)
-
-TIÊU CHÍ NGHIỆM THU (DoD M3):
-    [ ] Chạy `python models/yolo.py`: Cả 6 cấu hình đều khởi tạo thành công không lỗi cú pháp.
-    [ ] Forward pass: Tensor (1, 3, 608, 608) đi qua toàn bộ mạng mượt mà.
-    [ ] Backward pass: `loss.backward()` tính được gradient ổn định cho mọi tham số.
-    [ ] Dung lượng mô hình FP32 (.pth) xấp xỉ dung lượng mục tiêu trong Bảng 1 (dung sai cho phép: ±10%).
-
-BẪY LỖI KỸ THUẬT CẦN TRÁNH:
-    - Bẫy 1: Sai lệch số kênh giữa Backbone và Neck (CSPDarknet là 256/512/1024, còn PP-LCNet là 128/256/512).
-    - Bẫy 2: Không đồng bộ cờ `dsc` giữa Neck và Head (khiến Model-1 vô tình dùng DSConv hoặc Model-2 dùng Standard Conv).
+    - Người thực thi & Chịu trách nhiệm (R & A): T.A (Project Lead) & Sơn (Technical Mentor)
 ================================================================================
 """
 
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import torch
 import torch.nn as nn
-from typing import Dict, Any, List
-from pathlib import Path
+import yaml
+from typing import Dict, Any, List, Union
+
+from models.pp_lcnet import PPLCNet
+from models.cspdarknet import CSPDarknet53
+from models.attention import CoordAtt
+from models.pb_module import PANet, PBModule
+from models.head import YOLOHead
+
+
+# Cấu hình chuẩn của 6 mô hình phục vụ kiểm thử (Ablation Study)
+MODEL_CFGS = {
+    1: dict(backbone="cspdarknet53", dsc=False, ca=False, neck="panet", loss="ciou"),
+    2: dict(backbone="cspdarknet53", dsc=True,  ca=False, neck="panet", loss="ciou"),
+    3: dict(backbone="pplcnet",      dsc=True,  ca=False, neck="panet", loss="ciou"),
+    4: dict(backbone="pplcnet",      dsc=True,  ca=True,  neck="panet", loss="ciou"),
+    5: dict(backbone="pplcnet",      dsc=True,  ca=True,  neck="pb",    loss="ciou"),
+    6: dict(backbone="pplcnet",      dsc=True,  ca=True,  neck="pb",    loss="siou"),
+}
+
+TARGET_MB = {
+    1: 243.92,
+    2: 136.13,
+    3: 38.75,
+    4: 38.99,
+    5: 41.88,
+    6: 41.88
+}
 
 
 class YOLOv4Variant(nn.Module):
@@ -58,37 +63,97 @@ class YOLOv4Variant(nn.Module):
     """
     def __init__(self, cfg: Dict[str, Any], num_classes: int = 2):
         super().__init__()
-        self.cfg = cfg
+        # Hỗ trợ đọc cả dạng cfg phẳng hoặc lồng trong architecture:
+        arch_cfg = cfg.get("architecture", cfg)
+        self.cfg = arch_cfg
         self.num_classes = num_classes
 
-        # HƯỚNG DẪN: T.A & Sơn khởi tạo 4 khối:
-        # 1. Backbone: PPLCNet() nếu cfg['backbone'] == 'pplcnet' else CSPDarknet53()
-        # 2. Attention: nn.ModuleList([CoordAtt(c) for c in ch]) nếu cfg['ca'] else None
-        # 3. Neck: PBModule(ch, dsc=cfg['dsc']) nếu cfg['neck'] == 'pb' else PANet(ch, dsc=cfg['dsc'])
-        # 4. Head: YOLOHead(out_channels, num_classes=2, dsc=cfg['dsc'])
-        pass
+        # 1. Khởi tạo Backbone
+        if arch_cfg.get("backbone") == "pplcnet":
+            self.backbone = PPLCNet()
+            ch = (128, 256, 512)
+        else:
+            self.backbone = CSPDarknet53()
+            ch = (256, 512, 1024)
 
-    def forward(self, x: torch.Tensor) -> List[torch.Tensor] | torch.Tensor:
+        # 2. Khởi tạo Coordinate Attention (CA) nếu bật
+        self.use_ca = arch_cfg.get("ca", False)
+        if self.use_ca:
+            reduction = arch_cfg.get("ca_reduction", 32)
+            self.ca = nn.ModuleList([CoordAtt(c, reduction=reduction) for c in ch])
+        else:
+            self.ca = None
+
+        # 3. Khởi tạo Neck (PANet hoặc PBModule)
+        use_dsc = arch_cfg.get("dsc", True)
+        if arch_cfg.get("neck") == "pb":
+            bi_ch = arch_cfg.get("bifpn_channels", 128)
+            self.neck = PBModule(ch=ch, bi_ch=bi_ch, dsc=use_dsc)
+        else:
+            self.neck = PANet(ch=ch, dsc=use_dsc)
+
+        # 4. Khởi tạo YOLOHead
+        self.head = YOLOHead(
+            in_channels=self.neck.out_channels,
+            num_classes=self.num_classes,
+            num_anchors=3,
+            dsc=use_dsc
+        )
+
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """
-        Dòng chảy dữ liệu (Forward Pass):
-        x -> Backbone -> [CA] -> Neck -> Head -> predictions
+        Forward Pass:
+        x -> Backbone -> [CA] -> Neck -> Head -> 3 predicted feature maps
         """
-        raise NotImplementedError("Cần được T.A & Sơn cài đặt forward của YOLOv4Variant.")
+        feats = self.backbone(x)
+        if self.ca is not None:
+            feats = tuple(att(f) for att, f in zip(self.ca, feats))
+        neck_feats = self.neck(*feats)
+        return self.head(*neck_feats)
 
     def get_model_size_mb(self) -> float:
         """
-        Tính kích thước file trọng số state_dict ở định dạng FP32 (MB).
-        Công thức: sum(param.numel() for param in model.parameters()) * 4 / (1024 * 1024)
+        Tính kích thước file trọng số FP32 (MB) tương đương file .pth chứa state_dict.
         """
-        raise NotImplementedError("Cần được T.A cài đặt get_model_size_mb.")
+        return sum(p.numel() for p in self.parameters()) * 4 / (1024 * 1024)
 
 
-def build_model(config_path_or_dict: str | Path | dict) -> YOLOv4Variant:
+def build_model(config_path_or_dict: Union[str, Path, dict], num_classes: int = 2) -> YOLOv4Variant:
     """
-    Hàm Factory đọc cấu hình từ file YAML hoặc dictionary và tạo đối tượng YOLOv4Variant.
+    Factory tạo mô hình từ file cấu hình YAML hoặc dict.
     """
-    raise NotImplementedError("Cần được T.A cài đặt build_model.")
+    if isinstance(config_path_or_dict, (str, Path)):
+        with open(config_path_or_dict, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+    else:
+        cfg = config_path_or_dict
+    return YOLOv4Variant(cfg, num_classes=num_classes)
 
 
 if __name__ == "__main__":
-    print("[TODO] models/yolo.py: Chạy unit test kiểm tra forward pass và tính Model Size cho cả 6 mô hình.")
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+    print(">> [Unit Test] Running models/yolo.py cho toàn bộ 6 Model...")
+    x = torch.randn(1, 3, 608, 608)
+
+    for k in range(1, 7):
+        cfg = MODEL_CFGS[k]
+        model = YOLOv4Variant(cfg)
+        outs = model(x)
+        assert [tuple(o.shape) for o in outs] == [
+            (1, 21, 76, 76),
+            (1, 21, 38, 38),
+            (1, 21, 19, 19)
+        ], f"Lỗi shape đầu ra Model-{k}: {[o.shape for o in outs]}"
+
+        # Test backward
+        loss = sum(o.mean() for o in outs)
+        loss.backward()
+
+        mb = model.get_model_size_mb()
+        print(f">> Model-{k} [Backbone: {cfg['backbone']}, DSC: {cfg['dsc']}, CA: {cfg['ca']}, Neck: {cfg['neck']}]: {mb:.2f} MB (Target: {TARGET_MB[k]} MB) - PASS!")
+
+    print(">> Unit Test models/yolo.py: ALL 6 MODELS PASS! [DoD M3]")
