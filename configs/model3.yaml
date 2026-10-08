@@ -1,0 +1,41 @@
+# ==============================================================================
+# CẤU HÌNH MÔ HÌNH: Model-3 (PP-LCNet Backbone + DSConv)
+# Phụ trách huấn luyện: Hưng (Colab 2) | RACI: Hưng (R), T.A (A)
+# ==============================================================================
+# ĐẶC TẢ KIẾN TRÚC:
+#   - Backbone: PP-LCNet x1.0 (Cắt bỏ GAP và FC layer)
+#   - Convolution: DSConv 3x3 (dsc=True)
+#   - Attention: Không áp dụng (ca=False)
+#   - Neck: PANet rút gọn số kênh phù hợp PP-LCNet (C3=128, C4=256, C5=512)
+#   - Loss: CIoU Loss cho hồi quy Bounding Box
+#
+# CHỈ TIÊU NGHIỆM THU THEO BÀI BÁO (Bảng 1):
+#   - AP Hat:        88.85%
+#   - AP Person:     89.38%
+#   - mAP@0.5:       89.34% (Sai lệch nội tại bài báo, chấp nhận dung sai ±1.0%)
+#   - Dung lượng:    38.75 MB (Giảm ~84.1% so với Model-1)
+# ==============================================================================
+
+model_id: "model_3"
+model_name: "YOLOv4-PPLCNet"
+
+architecture:
+  backbone: "pplcnet"         # Thay thế bằng PP-LCNet nhẹ
+  dsc: true
+  ca: false
+  neck: "panet"
+  neck_channels: [128, 256, 512]
+  loss: "ciou"
+
+training:
+  epochs_freeze: 50
+  lr_freeze: 0.001
+  batch_size_freeze: 16
+
+  epochs_unfreeze: 150
+  lr_unfreeze: 0.0001
+  batch_size_unfreeze: 8
+
+  optimizer: "Adam"
+  scheduler: "CosineAnnealingLR"
+  save_interval_epochs: 10

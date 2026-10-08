@@ -1,0 +1,43 @@
+# ==============================================================================
+# CẤU HÌNH MÔ HÌNH: Model-5 (PP-LCNet + CA + PB Module + CIoU Loss)
+# Phụ trách huấn luyện: T.A (Colab 4) | RACI: T.A (R & A)
+# ==============================================================================
+# ĐẶC TẢ KIẾN TRÚC:
+#   - Backbone: PP-LCNet x1.0
+#   - Convolution: DSConv 3x3 (dsc=True)
+#   - Attention: Coordinate Attention (ca=True)
+#   - Neck: PB Module (SPP + PANet + BiFPN với weighted fusion & cùng tầng residual)
+#   - Loss: CIoU Loss cho hồi quy Bounding Box (để đối chiếu công bằng với SIoU ở Model-6)
+#
+# CHỈ TIÊU NGHIỆM THU THEO BÀI BÁO (Bảng 1):
+#   - AP Hat:        90.54%
+#   - AP Person:     92.03%
+#   - mAP@0.5:       91.29% (Dung sai chấp nhận: ±1.0%)
+#   - Dung lượng:    41.88 MB (Tăng do khối BiFPN)
+# ==============================================================================
+
+model_id: "model_5"
+model_name: "YOLOv4-PPLCNet-CA-PB-CIoU"
+
+architecture:
+  backbone: "pplcnet"
+  dsc: true
+  ca: true
+  ca_reduction: 32
+  neck: "pb"                  # Sử dụng PB Module (PANet + BiFPN)
+  neck_channels: [128, 256, 512]
+  bifpn_channels: 128
+  loss: "ciou"                # Vẫn dùng CIoU để cô lập hiệu quả của neck
+
+training:
+  epochs_freeze: 50
+  lr_freeze: 0.001
+  batch_size_freeze: 16
+
+  epochs_unfreeze: 150
+  lr_unfreeze: 0.0001
+  batch_size_unfreeze: 8
+
+  optimizer: "Adam"
+  scheduler: "CosineAnnealingLR"
+  save_interval_epochs: 10

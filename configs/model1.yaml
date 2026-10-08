@@ -1,0 +1,42 @@
+# ==============================================================================
+# CẤU HÌNH MÔ HÌNH: Model-1 (Baseline YOLOv4 Gốc)
+# Phụ trách huấn luyện: Sơn (Colab 1) | RACI: Sơn (R), T.A (A)
+# ==============================================================================
+# ĐẶC TẢ KIẾN TRÚC:
+#   - Backbone: CSPDarknet53 chuẩn
+#   - Convolution: Tích chập tiêu chuẩn (Standard Conv 3x3, dsc=False)
+#   - Attention: Không áp dụng (ca=False)
+#   - Neck: PANet tiêu chuẩn + SPP
+#   - Loss: CIoU Loss cho hồi quy Bounding Box
+#
+# CHỈ TIÊU NGHIỆM THU THEO BÀI BÁO (Bảng 1 & Bảng 2):
+#   - AP Hat:        93.15%
+#   - AP Person:     91.77%
+#   - mAP@0.5:       92.46% (Dung sai chấp nhận: ±1.0%)
+#   - Dung lượng:    243.92 MB (Trọng số FP32 state_dict)
+#   - FPS tham chiếu: ~23.02 FPS
+# ==============================================================================
+
+model_id: "model_1"
+model_name: "YOLOv4-Baseline"
+
+architecture:
+  backbone: "cspdarknet53"
+  dsc: false                  # Standard Convolution
+  ca: false                   # No Coordinate Attention
+  neck: "panet"               # Standard PANet
+  neck_channels: [256, 512, 1024]
+  loss: "ciou"                # Complete IoU Loss
+
+training:
+  epochs_freeze: 50           # Giai đoạn 1: Freeze backbone
+  lr_freeze: 0.001
+  batch_size_freeze: 16
+
+  epochs_unfreeze: 150        # Giai đoạn 2: Unfreeze toàn bộ mạng
+  lr_unfreeze: 0.0001
+  batch_size_unfreeze: 8
+
+  optimizer: "Adam"
+  scheduler: "CosineAnnealingLR"
+  save_interval_epochs: 10

@@ -1,2 +1,38 @@
-# Large local dataset archives must not be committed to Git.
+# Datasets & Archives
 Dataset_Split-*.zip
+*.zip
+*.tar
+*.tar.gz
+data/
+dataset/
+datasets/raw/
+datasets/processed/
+/content/
+
+# Model Checkpoints & Weights
+weights/
+runs/
+*.pth
+*.pt
+*.onnx
+
+# Python & Environment
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+venv/
+env/
+.venv/
+
+# Jupyter & IDE
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# Experiment Logs & Artifacts
+experiments/
+logs/
+results/
+scratch/

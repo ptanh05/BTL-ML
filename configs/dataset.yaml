@@ -1,0 +1,44 @@
+# ==============================================================================
+# FILE CẤU HÌNH DỮ LIỆU: Safety Helmet Wearing Dataset (SHWD)
+# Phụ trách: Sơn (Technical Mentor) | Quản lý: T.A (Project Lead)
+# ==============================================================================
+# MỤC ĐÍCH:
+#   - Định nghĩa đường dẫn tập train / val / test.
+#   - Định nghĩa 2 nhãn mục tiêu: 'hat' (0) và 'person' (1).
+#   - Thiết lập các siêu tham số đầu vào (kích thước ảnh 608x608, 9 cụm anchor).
+#
+# LƯU Ý KỸ THUẬT:
+#   - Bộ dữ liệu SHWD đã làm sạch gồm 7,004 ảnh (7,709 nhãn hat, 101,174 nhãn person).
+#   - Khi chạy trên Google Colab, giải nén về SSD cục bộ `/content/dataset` để tránh nghẽn I/O Google Drive.
+# ==============================================================================
+
+# 1. Đường dẫn thư mục dữ liệu
+dataset_name: "SHWD"
+data_dir: "dataset"                    # Đường dẫn local đã giải nén
+annotations_dir: "dataset/annotations" # Thư mục chứa 7,581 file Pascal VOC XML
+colab_data_dir: "/content/dataset"     # Đường dẫn trên Colab SSD
+
+# Đường dẫn danh sách file chia tập (80% train / 10% val / 10% test)
+train_split: "datasets/splits/train.txt"
+val_split: "datasets/splits/val.txt"
+test_split: "datasets/splits/test.txt"
+
+# 2. Định nghĩa nhãn lớp (Số lớp = 2)
+num_classes: 2
+class_names:
+  - "hat"       # ID: 0 - Đội mũ bảo hộ
+  - "person"    # ID: 1 - Người / không đội mũ bảo hộ
+
+# 3. Kích thước đầu vào chuẩn hóa
+img_size: [608, 608]    # (Chiều cao, Chiều rộng)
+channels: 3
+
+# 4. Cụm Anchor Boxes (9 anchors chia đều cho 3 tầng feature maps)
+# Sử dụng 9 anchor chuẩn của YOLOv4 hoặc kết quả K-Means trên SHWD:
+#   - Tầng C3 (76x76 - Small objects):  [12, 16],  [19, 36],  [40, 28]
+#   - Tầng C4 (38x38 - Medium objects): [36, 75],  [76, 55],  [72, 146]
+#   - Tầng C5 (19x19 - Large objects):  [142, 110], [192, 243], [459, 401]
+anchors:
+  - [[12, 16], [19, 36], [40, 28]]
+  - [[36, 75], [76, 55], [72, 146]]
+  - [[142, 110], [192, 243], [459, 401]]

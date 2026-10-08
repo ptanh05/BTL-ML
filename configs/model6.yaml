@@ -1,0 +1,46 @@
+# ==============================================================================
+# CẤU HÌNH MÔ HÌNH: Model-6 (MÔ HÌNH HOÀN CHỈNH - CẢI TIẾN TRỌN VẸN)
+# Phụ trách huấn luyện: Tú (Colab 5) | RACI: Tú (R), T.A (A)
+# ==============================================================================
+# ĐẶC TẢ KIẾN TRÚC:
+#   - Backbone: PP-LCNet x1.0 (nhẹ, nhanh, loại bỏ GAP/FC)
+#   - Convolution: Depthwise Separable Convolution (DSConv 3x3)
+#   - Attention: Coordinate Attention (CA) tăng cường đặc trưng không gian & kênh
+#   - Neck: PB Module (SPP + PANet + BiFPN) tăng cường đa tỉ lệ
+#   - Loss: SIoU Loss (Angle, Distance, Shape, IoU cost) thay thế CIoU
+#
+# CHỈ TIÊU NGHIỆM THU THEO BÀI BÁO (Bảng 1 & Bảng 2):
+#   - AP Hat:        94.34%  (Tăng +1.19% so với Baseline)
+#   - AP Person:     91.63%
+#   - mAP@0.5:       92.98%  (Tăng +0.52% so với Baseline, cao nhất trong 6 model)
+#   - Dung lượng:    41.88 MB (Giảm 82.8% dung lượng bộ nhớ so với Baseline 243.92 MB)
+#   - FPS tham chiếu: ~43.24 FPS (Tốc độ suy luận tăng ~1.87x so với Baseline)
+# ==============================================================================
+
+model_id: "model_6"
+model_name: "Improved-YOLOv4-Complete"
+
+architecture:
+  backbone: "pplcnet"
+  dsc: true
+  ca: true
+  ca_reduction: 32
+  neck: "pb"                  # PB Module (SPP + PANet + BiFPN)
+  neck_channels: [128, 256, 512]
+  bifpn_channels: 128
+  loss: "siou"                # Cải tiến cốt lõi: SIoU Loss
+  siou_theta: 4.0             # Tham số hình dạng Shape cost (theta)
+  siou_eps: 1e-7
+
+training:
+  epochs_freeze: 50
+  lr_freeze: 0.001
+  batch_size_freeze: 16
+
+  epochs_unfreeze: 150
+  lr_unfreeze: 0.0001
+  batch_size_unfreeze: 8
+
+  optimizer: "Adam"
+  scheduler: "CosineAnnealingLR"
+  save_interval_epochs: 10

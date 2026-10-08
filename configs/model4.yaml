@@ -1,0 +1,42 @@
+# ==============================================================================
+# CẤU HÌNH MÔ HÌNH: Model-4 (PP-LCNet + Coordinate Attention + DSConv)
+# Phụ trách huấn luyện: Tiến (Colab 3) | RACI: Tiến (R), T.A (A)
+# ==============================================================================
+# ĐẶC TẢ KIẾN TRÚC:
+#   - Backbone: PP-LCNet x1.0
+#   - Convolution: DSConv 3x3 (dsc=True)
+#   - Attention: Coordinate Attention (CA) đặt tại 3 đầu ra C3, C4, C5 (ca=True)
+#   - Neck: PANet
+#   - Loss: CIoU Loss cho hồi quy Bounding Box
+#
+# CHỈ TIÊU NGHIỆM THU THEO BÀI BÁO (Bảng 1):
+#   - AP Hat:        89.36%
+#   - AP Person:     92.82%
+#   - mAP@0.5:       90.09% (Dung sai chấp nhận: ±1.0%)
+#   - Dung lượng:    38.99 MB (Tăng nhẹ +0.24 MB do tham số CA rất nhỏ)
+# ==============================================================================
+
+model_id: "model_4"
+model_name: "YOLOv4-PPLCNet-CA"
+
+architecture:
+  backbone: "pplcnet"
+  dsc: true
+  ca: true                    # Bật Coordinate Attention
+  ca_reduction: 32
+  neck: "panet"
+  neck_channels: [128, 256, 512]
+  loss: "ciou"
+
+training:
+  epochs_freeze: 50
+  lr_freeze: 0.001
+  batch_size_freeze: 16
+
+  epochs_unfreeze: 150
+  lr_unfreeze: 0.0001
+  batch_size_unfreeze: 8
+
+  optimizer: "Adam"
+  scheduler: "CosineAnnealingLR"
+  save_interval_epochs: 10

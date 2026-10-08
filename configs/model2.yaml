@@ -1,0 +1,41 @@
+# ==============================================================================
+# CẤU HÌNH MÔ HÌNH: Model-2 (YOLOv4 + Depthwise Separable Convolution)
+# Phụ trách huấn luyện: Hưng (Colab 2) | RACI: Hưng (R), T.A (A)
+# ==============================================================================
+# ĐẶC TẢ KIẾN TRÚC:
+#   - Backbone: CSPDarknet53 chuẩn
+#   - Convolution: Tích chập sâu tách biệt (DSConv 3x3, dsc=True tại Neck & Head)
+#   - Attention: Không áp dụng (ca=False)
+#   - Neck: PANet kết hợp DSConv
+#   - Loss: CIoU Loss cho hồi quy Bounding Box
+#
+# CHỈ TIÊU NGHIỆM THU THEO BÀI BÁO (Bảng 1):
+#   - AP Hat:        92.71%
+#   - AP Person:     91.00%
+#   - mAP@0.5:       91.86% (Dung sai chấp nhận: ±1.0%)
+#   - Dung lượng:    136.13 MB (Giảm ~44.2% so với Model-1)
+# ==============================================================================
+
+model_id: "model_2"
+model_name: "YOLOv4-DSConv"
+
+architecture:
+  backbone: "cspdarknet53"
+  dsc: true                   # Bật DSConv ngoài backbone
+  ca: false                   # No Coordinate Attention
+  neck: "panet"
+  neck_channels: [256, 512, 1024]
+  loss: "ciou"
+
+training:
+  epochs_freeze: 50
+  lr_freeze: 0.001
+  batch_size_freeze: 16
+
+  epochs_unfreeze: 150
+  lr_unfreeze: 0.0001
+  batch_size_unfreeze: 8
+
+  optimizer: "Adam"
+  scheduler: "CosineAnnealingLR"
+  save_interval_epochs: 10
