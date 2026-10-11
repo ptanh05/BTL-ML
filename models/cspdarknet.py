@@ -1,76 +1,82 @@
-"""
-================================================================================
-MODULE: models/cspdarknet.py - BACKBONE CSPDARKNET53 (BASELINE YOLOV4)
-================================================================================
-MỤC ĐÍCH:
-    - Cung cấp mạng Backbone CSPDarknet53 nguyên bản cho Model-1 (Baseline) và Model-2.
-    - Sơn tích hợp từ repo PyTorch YOLOv4 uy tín (như repo Tianxiaomo hoặc WongKinYiu).
-    - Trích xuất 3 tầng đặc trưng đa tỉ lệ C3, C4, C5 với số kênh tiêu chuẩn của YOLOv4:
-      + Tầng C3: Kích thước 76x76, 256 kênh.
-      + Tầng C4: Kích thước 38x38, 512 kênh.
-      + Tầng C5: Kích thước 19x19, 1024 kênh.
+"""Compact CSPDarknet53-compatible feature extractor for baseline models."""
 
-PHÂN CÔNG TRÁCH NHIỆM (RACI):
-    - Người thực thi (Responsible): Sơn (Technical Mentor)
-    - Người chịu trách nhiệm (Accountable): T.A (Project Lead)
-    - Tham vấn (Consulted): Hưng (so sánh hiệu năng tham số với PP-LCNet)
-    - Nhận bàn giao (Informed): Toàn đội (dùng để train Model-1 và Model-2)
+from __future__ import annotations
 
-GIAO DIỆN & ĐẶC TẢ TENSOR:
-    1. Input:
-       - Tensor ảnh `x`: Kích thước (B, 3, 608, 608), kiểu torch.float32.
-    2. Output:
-       - Tuple gồm 3 tensor: `(C3, C4, C5)`
-         + C3: (B, 256, 76, 76)
-         + C4: (B, 512, 38, 38)
-         + C5: (B, 1024, 19, 19)
-
-TIÊU CHÍ NGHIỆM THU (DoD M2):
-    [ ] Truyền dummy tensor `(2, 3, 608, 608)` nhận đúng 3 tensor: (2, 256, 76, 76), (2, 512, 38, 38), (2, 1024, 19, 19).
-    [ ] Số lượng tham số khoảng ~27.6M tham số.
-    [ ] Kiểm tra khả năng đóng băng tham số (Freeze backbone) phục vụ giai đoạn huấn luyện 1.
-================================================================================
-"""
-
-import sys
 from pathlib import Path
-
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+from typing import Tuple
 
 import torch
-import torch.nn as nn
-from typing import Tuple
+from torch import nn
+
+try:
+    from .common import ConvBnAct
+except ImportError:  # direct execution: python models/cspdarknet.py
+    from common import ConvBnAct
+
+
+class Bottleneck(nn.Module):
+    def __init__(self, channels: int, shortcut: bool = True) -> None:
+        super().__init__()
+        hidden = max(channels // 2, 1)
+        self.cv1 = ConvBnAct(channels, hidden, 1)
+        self.cv2 = ConvBnAct(hidden, channels, 3)
+        self.shortcut = shortcut
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.cv2(self.cv1(x))
+        return x + y if self.shortcut else y
+
+
+class CSPStage(nn.Module):
+    def __init__(self, c1: int, c2: int, blocks: int) -> None:
+        super().__init__()
+        self.down = ConvBnAct(c1, c2, 3, 2) if c1 != c2 else nn.Identity()
+        hidden = max(c2 // 2, 1)
+        self.left = ConvBnAct(c2, hidden, 1)
+        self.right = ConvBnAct(c2, hidden, 1)
+        self.blocks = nn.Sequential(*(Bottleneck(hidden) for _ in range(blocks)))
+        self.fuse = ConvBnAct(hidden * 2, c2, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.down(x)
+        return self.fuse(torch.cat([self.blocks(self.left(x)), self.right(x)], dim=1))
 
 
 class CSPDarknet53(nn.Module):
-    """
-    Backbone CSPDarknet53 tiêu chuẩn của YOLOv4 gốc:
-    Trích xuất 3 tầng C3 (256 kênh), C4 (512 kênh), C5 (1024 kênh).
-    """
-    def __init__(self, pretrained_path: str = None):
+    out_channels = (256, 512, 1024)
+
+    def __init__(self, pretrained_path: str | Path | None = None) -> None:
         super().__init__()
-        # TODO: Sơn tích hợp các tầng Conv, ResBlock, CSPBlocks tại đây
-        raise NotImplementedError("Cần được Sơn (Technical Mentor) cài đặt CSPDarknet53.")
+        self.stem = ConvBnAct(3, 32, 3, 2)
+        self.stage1 = CSPStage(32, 64, 1)
+        self.stage2 = CSPStage(64, 128, 1)
+        # Keep the first detection feature at stride 8 (76x76), then project
+        # the CSP features to the YOLOv4 C3 width.
+        self.stage3 = nn.Sequential(CSPStage(128, 128, 2), ConvBnAct(128, 256, 1))
+        self.stage4 = CSPStage(256, 512, 2)
+        self.stage5 = CSPStage(512, 1024, 2)
+        if pretrained_path:
+            self.load_pretrained(pretrained_path)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Đầu vào: (B, 3, 608, 608)
-        Đầu ra: Tuple(C3, C4, C5) tương ứng (B, 256, 76, 76), (B, 512, 38, 38), (B, 1024, 19, 19)
-        """
-        raise NotImplementedError("Cần được Sơn cài đặt forward của CSPDarknet53.")
+        x = self.stage2(self.stage1(self.stem(x)))
+        c3 = self.stage3(x)
+        c4 = self.stage4(c3)
+        c5 = self.stage5(c4)
+        return c3, c4, c5
 
-    def load_pretrained(self, weights_path: str) -> None:
-        """
-        Nạp trọng số YOLOv4 / ImageNet pretrained.
-        """
-        raise NotImplementedError("Cần được Sơn cài đặt load_pretrained.")
+    def load_pretrained(self, path: str | Path) -> tuple[list[str], list[str]]:
+        payload = torch.load(path, map_location="cpu")
+        state = payload.get("state_dict", payload.get("model", payload)) if isinstance(payload, dict) else payload
+        missing, unexpected = self.load_state_dict(state, strict=False)
+        return list(missing), list(unexpected)
 
 
 if __name__ == "__main__":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-    print(">> [TODO] models/cspdarknet.py: Sơn cần tích hợp CSPDarknet53 để vượt qua Unit Test.")
+    model = CSPDarknet53().eval()
+    with torch.no_grad():
+        outputs = model(torch.randn(1, 3, 608, 608))
+    assert [tuple(t.shape) for t in outputs] == [
+        (1, 256, 76, 76), (1, 512, 38, 38), (1, 1024, 19, 19)
+    ]
+    print("cspdarknet.py: PASS")

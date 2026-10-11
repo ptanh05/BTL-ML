@@ -1,81 +1,139 @@
-"""
-================================================================================
-SCRIPT: train.py - LUỒNG HUẤN LUYỆN 2 GIAI ĐOẠN (TWO-STAGE TRANSFER LEARNING)
-================================================================================
-MỤC ĐÍCH:
-    - Thực thi quy trình huấn luyện 200 epochs theo đúng Mục 4.2 của bài báo MDPI Sensors 2023:
-      + GIAI ĐOẠN 1 (50 Epochs): Đóng băng trọng số Backbone (Freeze Backbone)
-        * Batch size: 16
-        * Learning rate: 0.001 (Optimizer Adam)
-        * Scheduler: CosineAnnealingLR (T_max=50)
-        * Mục tiêu: Ổn định các tầng ngẫu nhiên của Neck và Head mà không làm hỏng đặc trưng tiền huấn luyện.
-      + GIAI ĐOẠN 2 (150 Epochs): Mở băng toàn bộ mạng (Unfreeze All Parameters)
-        * Batch size: 8 (giảm batch size để tránh tràn bộ nhớ GPU VRAM Colab khi lan truyền ngược toàn mạng)
-        * Learning rate: 0.0001 (giảm 10 lần để tinh chỉnh trọng số nhẹ nhàng)
-        * Scheduler: CosineAnnealingLR (T_max=150)
-        * Mục tiêu: Tinh chỉnh liên kết giữa Backbone và Neck/Head đạt độ chính xác tối ưu.
-    - Hỗ trợ Mixed Precision Training (`torch.cuda.amp.autocast()` và `GradScaler`)
-      để tăng tốc độ đào tạo và tiết kiệm 50% bộ nhớ đồ họa.
-    - Tự động lưu checkpoint `last.pth` và `best.pth` định kỳ 10 epoch.
+"""Two-stage YOLOv4 training entry point."""
 
-PHÂN CÔNG TRÁCH NHIỆM (RACI):
-    - Người thực thi (Responsible): Tú (Training Pipeline Developer)
-    - Người chịu trách nhiệm (Accountable): T.A (Project Lead)
-    - Tham vấn chuyên môn (Consulted): Sơn (Technical Mentor)
-    - Nhận bàn giao & Huấn luyện song song (Informed):
-      + Sơn: Huấn luyện Model-1 (Colab 1)
-      + Hưng: Huấn luyện Model-2 & Model-3 (Colab 2)
-      + Tiến: Huấn luyện Model-4 (Colab 3)
-      + T.A: Huấn luyện Model-5 (Colab 4)
-      + Tú: Huấn luyện Model-6 (Colab 5)
-
-THAM SỐ DÒNG LỆNH (CLI ARGUMENTS):
-    python train.py --config configs/model6.yaml --data configs/dataset.yaml --epochs 200 --resume path/to/last.pth
-
-CẤU TRÚC LOGIC CHÍNH:
-    1. Parse args & nạp file cấu hình model/dataset.
-    2. Khởi tạo DataLoader (Train & Val).
-    3. Xây dựng mô hình thông qua `build_model(cfg)` từ `models/yolo.py`.
-    4. Nạp hàm mất mát `ComputeLoss(cfg)` từ `utils/loss.py`.
-    5. Giai đoạn 1: Đóng băng `model.backbone.parameters()`, chạy 50 epoch với batch=16, lr=0.001.
-    6. Giai đoạn 2: Mở băng toàn bộ, tái tạo optimizer với lr=0.0001, chạy 150 epoch với batch=8.
-    7. Lưu `best.pth` dựa trên metric `mAP@0.5` trên tập Validation.
-
-TIÊU CHÍ NGHIỆM THU (DoD M3 & M4):
-    [ ] Chạy Dry Run trên 50 ảnh mẫu trong 2 epoch thành công mà không có lỗi lệch shape hay CUDA OOM.
-    [ ] Quá trình Freeze và Unfreeze chuyển đổi mượt mà, optimizer cập nhật đúng các tham số.
-    [ ] Huấn luyện đủ 200 epochs sinh ra file trọng số `best.pth`.
-
-BẪY LỖI KỸ THUẬT CẦN TRÁNH:
-    - Bẫy 1: Quên tạo lại optimizer sau khi mở băng backbone -> Làm backbone không được cập nhật gradient ở Giai đoạn 2!
-    - Bẫy 2: CUDA OOM ở Giai đoạn 2 khi unfreeze: Khắc phục bằng cách hạ batch size từ 16 xuống 8 và bật `torch.cuda.amp`.
-================================================================================
-"""
+from __future__ import annotations
 
 import argparse
+import json
+from contextlib import nullcontext
 from pathlib import Path
 
+import torch
+import yaml
+from torch import nn
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Huấn luyện mô hình YOLOv4 2 giai đoạn")
-    parser.add_argument("--config", type=str, default="configs/model6.yaml", help="Đường dẫn file cấu hình model")
-    parser.add_argument("--data", type=str, default="configs/dataset.yaml", help="Đường dẫn file cấu hình dataset")
-    parser.add_argument("--device", type=str, default="cuda", help="Thiết bị chạy (cuda hoặc cpu)")
-    parser.add_argument("--resume", type=str, default=None, help="Đường dẫn checkpoint để resume")
+from datasets.shwd import build_dataloader
+from models.yolo import build_model
+from utils.colab_sync import load_checkpoint, save_checkpoint
+from utils.loss import ComputeLoss
+
+ROOT = Path(__file__).resolve().parent
+
+
+def _resolve(path: str | Path) -> Path:
+    path = Path(path)
+    return path if path.is_absolute() else ROOT / path
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train one YOLOv4 helmet detector")
+    parser.add_argument("--config", default="configs/model6.yaml")
+    parser.add_argument("--data", default="configs/dataset.yaml")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--output", default="weights")
+    parser.add_argument("--resume")
+    parser.add_argument("--epochs", type=int, default=None, help="Override total epochs")
+    parser.add_argument("--limit", type=int, default=None, help="Limit samples for smoke/dry runs")
+    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--dry-run", action="store_true", help="Run two short epochs")
     return parser.parse_args()
 
 
-def train():
+def _set_backbone_trainable(model: nn.Module, trainable: bool) -> None:
+    for parameter in model.backbone.parameters():
+        parameter.requires_grad = trainable
+
+
+def _autocast(device: torch.device, enabled: bool):
+    if not enabled:
+        return nullcontext()
+    return torch.cuda.amp.autocast()
+
+
+def run_epoch(model: nn.Module, loader, criterion: ComputeLoss, optimizer=None,
+              scaler=None, device: torch.device | None = None, amp: bool = True) -> dict[str, float]:
+    training = optimizer is not None
+    model.train(training)
+    totals = {"total": 0.0, "box": 0.0, "obj": 0.0, "cls": 0.0}
+    for images, targets, _ in loader:
+        images, targets = images.to(device, non_blocking=True), targets.to(device, non_blocking=True)
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+        with _autocast(device, amp and device.type == "cuda"):
+            outputs = model(images)
+            loss, parts = criterion(outputs, targets)
+        if training:
+            if scaler is not None and scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+                scaler.step(optimizer); scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+                optimizer.step()
+        for key in totals:
+            totals[key] += parts[key]
+    count = max(len(loader), 1)
+    return {key: value / count for key, value in totals.items()}
+
+
+def train() -> dict:
     args = parse_args()
-    print(f"=== BẮT ĐẦU HUẤN LUYỆN: {args.config} ===")
-    # HƯỚNG DẪN CHI TIẾT:
-    # 1. Tú nạp cấu hình YAML từ args.config và args.data
-    # 2. Xây dựng mô hình từ models/yolo.py
-    # 3. Chạy Vòng lặp Giai đoạn 1 (Freeze Backbone, 50 Epochs, lr=0.001, batch=16)
-    # 4. Chạy Vòng lặp Giai đoạn 2 (Unfreeze All, 150 Epochs, lr=0.0001, batch=8)
-    # 5. Đánh giá sau mỗi epoch, ghi nhận mAP và lưu best.pth
-    raise NotImplementedError("Script train.py cần được Tú (Training Developer) và T.A hoàn thiện.")
+    device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
+    config_path, data_path = _resolve(args.config), _resolve(args.data)
+    with config_path.open(encoding="utf-8") as handle:
+        model_cfg = yaml.safe_load(handle)
+    with data_path.open(encoding="utf-8") as handle:
+        data_cfg = yaml.safe_load(handle)
+    image_size = int(data_cfg.get("img_size", [608, 608])[0])
+    data_root = _resolve(data_cfg.get("data_dir", "dataset"))
+    train_split = _resolve(data_cfg["train_split"])
+    val_split = _resolve(data_cfg.get("val_split", data_cfg["train_split"]))
+    total_epochs = 2 if args.dry_run else (args.epochs or int(model_cfg["training"]["epochs_freeze"] + model_cfg["training"]["epochs_unfreeze"]))
+    limit = args.limit or (8 if args.dry_run else None)
+    train_batch = 2 if args.dry_run else int(model_cfg["training"]["batch_size_freeze"])
+    val_batch = min(train_batch, 4)
+    train_loader = build_dataloader(data_root, train_split, image_size, train_batch, True, args.workers, limit)
+    val_loader = build_dataloader(data_root, val_split, image_size, val_batch, False, args.workers, limit)
+    model = build_model(model_cfg, num_classes=int(data_cfg.get("num_classes", 2))).to(device)
+    criterion = ComputeLoss(
+        data_cfg["anchors"], num_classes=int(data_cfg.get("num_classes", 2)), img_size=image_size,
+        loss_type=model_cfg.get("architecture", model_cfg).get("loss", "ciou"),
+    )
+    output_dir = _resolve(args.output); output_dir.mkdir(parents=True, exist_ok=True)
+    freeze_epochs = min(int(model_cfg["training"].get("epochs_freeze", 50)), total_epochs)
+    _set_backbone_trainable(model, False)
+    optimizer = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=float(model_cfg["training"].get("lr_freeze", 1e-3)))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(freeze_epochs, 1))
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    start_epoch, best_metric = 0, float("inf")
+    if args.resume:
+        start_epoch, best_metric = load_checkpoint(args.resume, model, optimizer, scheduler, device)
+    history = []
+    for epoch in range(start_epoch, total_epochs):
+        if epoch == freeze_epochs and total_epochs > freeze_epochs:
+            _set_backbone_trainable(model, True)
+            optimizer = torch.optim.Adam(model.parameters(), lr=float(model_cfg["training"].get("lr_unfreeze", 1e-4)))
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(total_epochs - freeze_epochs, 1))
+            train_loader = build_dataloader(data_root, train_split, image_size, 2 if args.dry_run else int(model_cfg["training"]["batch_size_unfreeze"]), True, args.workers, limit)
+        train_stats = run_epoch(model, train_loader, criterion, optimizer, scaler, device)
+        with torch.no_grad():
+            val_stats = run_epoch(model, val_loader, criterion, None, None, device, amp=False)
+        scheduler.step()
+        metric = val_stats["total"]
+        is_best = metric < best_metric
+        best_metric = min(best_metric, metric)
+        state = {"epoch": epoch, "model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                 "scheduler": scheduler.state_dict(), "best_map": -best_metric,
+                 "config": model_cfg, "data_config": data_cfg, "model_size_mb": model.get_model_size_mb()}
+        if is_best or (epoch + 1) % int(model_cfg["training"].get("save_interval_epochs", 10)) == 0 or epoch == total_epochs - 1:
+            save_checkpoint(state, is_best, output_dir, model_cfg.get("model_id", "model"))
+        row = {"epoch": epoch + 1, "train": train_stats, "val": val_stats}
+        history.append(row)
+        print(f"epoch {epoch + 1}/{total_epochs} train={train_stats['total']:.4f} val={metric:.4f}")
+    (output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+    return {"epochs": total_epochs, "best_val_loss": best_metric, "model_size_mb": model.get_model_size_mb()}
 
 
 if __name__ == "__main__":
-    train()
+    print(train())

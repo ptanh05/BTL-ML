@@ -1,120 +1,138 @@
-"""
-================================================================================
-MODULE: utils/loss.py - HÀM MẤT MÁT SIOU LOSS, CIOU LOSS & TỔNG LOSS YOLOV4
-================================================================================
-MỤC ĐÍCH:
-    - Cài đặt hàm mất mát hồi quy bounding box tiên tiến SCYLLA-IoU (SIoU Loss)
-      cho Model-6 (Mục 3.4, Công thức 2-6 bài báo).
-    - Cài đặt Complete IoU (CIoU Loss) cho Model-1 đến Model-5 nhằm đảm bảo đối chứng công bằng.
-    - Xây dựng lớp tổng hợp `ComputeLoss` tính toán 3 thành phần mất mát:
-      + Loss hồi quy hộp bao (Box Loss): CIoU hoặc SIoU.
-      + Loss độ tin cậy đối tượng (Objectness Loss): BCEWithLogitsLoss.
-      + Loss phân lớp mục tiêu (Classification Loss): BCEWithLogitsLoss.
+"""CIoU/SIoU losses and a small YOLO-style multi-scale training loss."""
 
-PHÂN CÔNG TRÁCH NHIỆM (RACI):
-    - Người thực thi (Responsible): Tú (Loss & Training Pipeline Developer)
-    - Người chịu trách nhiệm (Accountable): T.A (Project Lead)
-    - Tham vấn (Consulted): Sơn (Technical Mentor - hướng dẫn bẫy giải tích đạo hàm)
-    - Nhận bàn giao (Informed): Toàn đội (sử dụng trong vòng lặp huấn luyện train.py)
-
-GIAO DIỆN & ĐẶC TẢ TENSOR:
-    1. Input:
-       - `pred`: Tensor dự đoán (N, 4) dạng [cx, cy, w, h] (hoặc x1, y1, x2, y2).
-       - `target`: Tensor nhãn ground truth (N, 4) cùng dạng tọa độ.
-    2. Output:
-       - `loss_scalar`: Tensor scalar (0-dim tensor), giá trị > 0, không chứa NaN hay Inf.
-
-CÔNG THỨC TOÁN HỌC CỐT LÕI CỦA SIOU (MDPI Sensors 2023):
-    1. Góc định hướng (Angle Cost - Công thức 2):
-       - dx = tx - px, dy = ty - py
-       - sigma = sqrt(dx^2 + dy^2 + eps)  <-- BẮT BUỘC eps NẰM TRONG CĂN!
-       - sin_alpha = clamp(|dy| / sigma, min=0.0, max=0.9999)  <-- BẪY LỖI NaN TRƯỚC HÀM ASIN!
-       - angle = 1 - 2 * sin(arcsin(sin_alpha) - pi / 4)^2
-    2. Khoảng cách (Distance Cost - Công thức 3):
-       - gamma = 2 - angle
-       - cw, enc_h là chiều rộng và chiều cao của hộp bao nhỏ nhất chứa cả pred và target
-       - rho_x = (dx / (cw + eps))^2, rho_y = (dy / (enc_h + eps))^2
-       - dist = (1 - exp(-gamma * rho_x)) + (1 - exp(-gamma * rho_y))
-    3. Hình dạng (Shape Cost - Công thức 4):
-       - omega_w = |pw - tw| / (max(pw, tw) + eps)
-       - omega_h = |ph - th| / (max(ph, th) + eps)
-       - shape = (1 - exp(-omega_w))^theta + (1 - exp(-omega_h))^theta  (chọn theta = 4.0)
-    4. Chi phí IoU (IoU Cost - Công thức 5) & Tổng SIoU (Công thức 6):
-       - SIoU_loss = 1 - IoU + (dist + shape) / 2
-
-TIÊU CHÍ NGHIỆM THU (DoD M2):
-    [ ] Chạy unit test độc lập với tensor ngẫu nhiên: Loss scalar dương, backward pass không NaN.
-    [ ] Kiểm tra trường hợp biên khó nhất (ca hai tâm box trùng nhau: dx=0, dy=0):
-        Đạo hàm vẫn phải hữu hạn và gradient không bị tràn số!
-
-BẪY LỖI KỸ THUẬT BẮT BUỘC PHẢI TRÁNH:
-    - Bẫy 1: NaN do `torch.asin()` khi tỉ số vượt quá 1.0 (do sai số làm tròn số thực)
-      -> BẮT BUỘC dùng `clamp(min=0.0, max=0.9999)`.
-    - Bẫy 2: NaN gradient khi đặt eps ngoài căn `sqrt(...) + eps`: Khi dx=0, dy=0 thì đạo hàm
-      của sqrt tại 0 là 1 / (2*sqrt(0)) = vô cực (Inf). Phải đặt eps TRONG căn: `sqrt(dx^2 + dy^2 + eps)`.
-================================================================================
-"""
+from __future__ import annotations
 
 import math
+from typing import Iterable
+
 import torch
-import torch.nn as nn
-from typing import Tuple, Dict, Any
+import torch.nn.functional as F
 
 
-def siou_loss(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    theta: float = 4.0,
-    eps: float = 1e-7
-) -> torch.Tensor:
-    """
-    Tính hàm mất mát SCYLLA-IoU (SIoU Loss) giữa dự đoán và nhãn.
-    
-    Args:
-        pred: (N, 4) tensor dạng [cx, cy, w, h]
-        target: (N, 4) tensor dạng [cx, cy, w, h]
-        theta: Tham số hình dạng (mặc định 4.0)
-        eps: Hằng số tránh chia cho 0
-        
-    Returns:
-        torch.Tensor: Giá trị loss trung bình (scalar).
-    """
-    # HƯỚNG DẪN: Tú triển khai 4 chi phí (Angle, Distance, Shape, IoU) theo tài liệu
-    raise NotImplementedError("Cần được Tú cài đặt siou_loss.")
+def _xywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
+    cx, cy, w, h = boxes.unbind(-1)
+    return torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1)
+
+
+def _iou(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    p, t = _xywh_to_xyxy(pred), _xywh_to_xyxy(target)
+    lt = torch.maximum(p[..., :2], t[..., :2])
+    rb = torch.minimum(p[..., 2:], t[..., 2:])
+    inter = (rb - lt).clamp(min=0).prod(-1)
+    area_p = (p[..., 2:] - p[..., :2]).clamp(min=0).prod(-1)
+    area_t = (t[..., 2:] - t[..., :2]).clamp(min=0).prod(-1)
+    return inter / (area_p + area_t - inter + eps)
 
 
 def ciou_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
-    """
-    Tính hàm mất mát Complete IoU (CIoU Loss) cho Model-1 đến Model-5.
-    """
-    raise NotImplementedError("Cần được Tú cài đặt ciou_loss.")
+    """Complete IoU loss for ``[..., cx, cy, w, h]`` boxes."""
+    iou = _iou(pred, target, eps)
+    p, t = _xywh_to_xyxy(pred), _xywh_to_xyxy(target)
+    center_dist = ((pred[..., :2] - target[..., :2]) ** 2).sum(-1)
+    enclose_lt = torch.minimum(p[..., :2], t[..., :2])
+    enclose_rb = torch.maximum(p[..., 2:], t[..., 2:])
+    c2 = ((enclose_rb - enclose_lt) ** 2).sum(-1).clamp_min(eps)
+    v = (4 / math.pi ** 2) * (
+        torch.atan(target[..., 2] / target[..., 3].clamp_min(eps))
+        - torch.atan(pred[..., 2] / pred[..., 3].clamp_min(eps))
+    ) ** 2
+    alpha = v / (1 - iou + v + eps)
+    return 1 - iou + center_dist / c2 + alpha * v
 
 
-class ComputeLoss(nn.Module):
-    """
-    Lớp tổng hợp tính toàn bộ hàm mất mát cho quá trình huấn luyện YOLOv4:
-    Loss = Loss_box (CIoU/SIoU) + Loss_objectness (BCE) + Loss_classification (BCE).
-    """
-    def __init__(self, model_cfg: Dict[str, Any], num_classes: int = 2):
-        super().__init__()
-        self.loss_type = model_cfg.get("loss", "ciou")
+def siou_loss(pred: torch.Tensor, target: torch.Tensor, theta: float = 4.0,
+              eps: float = 1e-7) -> torch.Tensor:
+    """SIoU loss with finite gradients when box centres coincide."""
+    iou = _iou(pred, target, eps)
+    px, py, pw, ph = pred.unbind(-1)
+    tx, ty, tw, th = target.unbind(-1)
+    dx, dy = tx - px, ty - py
+    sigma = torch.sqrt(dx.square() + dy.square() + eps)
+    sin_alpha = (dy.abs() / sigma).clamp(0.0, 0.9999)
+    angle = 1 - 2 * torch.sin(torch.asin(sin_alpha) - math.pi / 4).square()
+    gamma = 2 - angle
+    p_xyxy, t_xyxy = _xywh_to_xyxy(pred), _xywh_to_xyxy(target)
+    enc_w = (torch.maximum(p_xyxy[..., 2], t_xyxy[..., 2])
+             - torch.minimum(p_xyxy[..., 0], t_xyxy[..., 0])).clamp_min(eps)
+    enc_h = (torch.maximum(p_xyxy[..., 3], t_xyxy[..., 3])
+             - torch.minimum(p_xyxy[..., 1], t_xyxy[..., 1])).clamp_min(eps)
+    rho_x = (dx / enc_w).square()
+    rho_y = (dy / enc_h).square()
+    distance = (1 - torch.exp(-gamma * rho_x)) + (1 - torch.exp(-gamma * rho_y))
+    omega_w = (pw - tw).abs() / torch.maximum(pw, tw).clamp_min(eps)
+    omega_h = (ph - th).abs() / torch.maximum(ph, th).clamp_min(eps)
+    shape = (1 - torch.exp(-omega_w)).pow(theta) + (1 - torch.exp(-omega_h)).pow(theta)
+    return 1 - iou + 0.5 * (distance + shape)
+
+
+class ComputeLoss:
+    """Assign one anchor per target and train the three YOLO output scales."""
+
+    def __init__(self, anchors: Iterable, num_classes: int = 2, img_size: int = 608,
+                 loss_type: str = "ciou", box_gain: float = 5.0,
+                 obj_gain: float = 1.0, cls_gain: float = 1.0) -> None:
+        self.anchors = [torch.tensor(level, dtype=torch.float32) for level in anchors]
         self.num_classes = num_classes
-        # HƯỚNG DẪN: Tú khởi tạo các tiêu chuẩn mất mát BCEWithLogitsLoss
-        pass
+        self.img_size = img_size
+        self.loss_type = loss_type.lower()
+        self.box_gain, self.obj_gain, self.cls_gain = box_gain, obj_gain, cls_gain
+        self.bce = torch.nn.BCEWithLogitsLoss(reduction="mean")
 
-    def forward(
-        self, preds: list[torch.Tensor], targets: torch.Tensor
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Đầu vào:
-            preds: Danh sách 3 tensor thô từ YOLOHead.
-            targets: Tensor nhãn (M, 6) [batch_idx, class_id, cx, cy, w, h].
-        Đầu ra:
-            total_loss: Tensor scalar để chạy loss.backward().
-            loss_items: Dict chứa chi tiết {'box_loss': float, 'obj_loss': float, 'cls_loss': float}.
-        """
-        raise NotImplementedError("Cần được Tú cài đặt ComputeLoss forward.")
+    def __call__(self, outputs: list[torch.Tensor], targets: torch.Tensor):
+        device = outputs[0].device
+        box_loss = outputs[0].new_zeros(())
+        obj_loss = outputs[0].new_zeros(())
+        cls_loss = outputs[0].new_zeros(())
+        for level, output in enumerate(outputs):
+            bsz, _, height, width = output.shape
+            n_anchor = self.anchors[level].shape[0]
+            values = 5 + self.num_classes
+            raw = output.view(bsz, n_anchor, values, height, width).permute(0, 1, 3, 4, 2)
+            obj_target = torch.zeros((bsz, n_anchor, height, width), device=device)
+            anchors = self.anchors[level].to(device)
+            positives = []
+            if targets.numel():
+                for row in targets:
+                    batch, cls, cx, cy, bw, bh = row.tolist()
+                    size = max(bw, bh) * self.img_size
+                    expected_level = 0 if size < 64 else 1 if size < 192 else 2
+                    if expected_level != level:
+                        continue
+                    ratios = torch.maximum(
+                        torch.tensor([bw * self.img_size, bh * self.img_size], device=device) / anchors,
+                        anchors / torch.tensor([bw * self.img_size, bh * self.img_size], device=device).clamp_min(1e-6),
+                    ).amax(dim=1)
+                    anchor_idx = int(ratios.argmin())
+                    gx = min(width - 1, max(0, int(cx * width)))
+                    gy = min(height - 1, max(0, int(cy * height)))
+                    positives.append((int(batch), anchor_idx, gx, gy, int(cls), cx, cy, bw, bh))
+                    obj_target[int(batch), anchor_idx, gy, gx] = 1.0
+            obj_loss = obj_loss + self.bce(raw[..., 4], obj_target)
+            for batch, anchor_idx, gx, gy, cls, cx, cy, bw, bh in positives:
+                pred = raw[batch, anchor_idx, gy, gx]
+                anchor = anchors[anchor_idx] / self.img_size
+                pred_box = torch.stack([
+                    (pred[0].sigmoid() + gx) / width,
+                    (pred[1].sigmoid() + gy) / height,
+                    pred[2].clamp(-10, 10).exp() * anchor[0],
+                    pred[3].clamp(-10, 10).exp() * anchor[1],
+                ])
+                target_box = pred.new_tensor([cx, cy, bw, bh])
+                loss_fn = siou_loss if self.loss_type == "siou" else ciou_loss
+                box_loss = box_loss + loss_fn(pred_box.unsqueeze(0), target_box.unsqueeze(0)).mean()
+                target_cls = torch.zeros(self.num_classes, device=device)
+                target_cls[cls] = 1.0
+                cls_loss = cls_loss + self.bce(pred[5:], target_cls)
+        total = self.box_gain * box_loss + self.obj_gain * obj_loss + self.cls_gain * cls_loss
+        parts = {"total": float(total.detach()), "box": float(box_loss.detach()),
+                 "obj": float(obj_loss.detach()), "cls": float(cls_loss.detach())}
+        return total, parts
 
 
 if __name__ == "__main__":
-    print("[TODO] utils/loss.py: Chạy unit test kiểm tra SIoU và trường hợp tâm trùng nhau.")
+    target = torch.tensor([[0.5, 0.5, 0.2, 0.2]])
+    pred = target.clone().requires_grad_(True)
+    loss = siou_loss(pred, target).mean()
+    loss.backward()
+    assert torch.isfinite(pred.grad).all()
+    print("loss.py: PASS")

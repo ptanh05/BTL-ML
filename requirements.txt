@@ -6,8 +6,8 @@
 # build already; these pins keep all team environments reproducible.
 
 # Deep learning
-torch==2.13.0
-torchvision==0.28.0
+torch==2.11.0
+torchvision==0.26.0
 
 # Numerical computing and image pipeline
 numpy>=2.0,<3

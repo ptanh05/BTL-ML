@@ -1,116 +1,99 @@
-"""
-================================================================================
-MODULE: models/pp_lcnet.py - BACKBONE MẠNG NHẸ PP-LCNET x1.0
-================================================================================
-MỤC ĐÍCH:
-    - Xây dựng mạng Backbone nhẹ PP-LCNet phiên bản x1.0 theo bài báo gốc (Baidu / PaddleClas).
-    - Cắt bỏ hoàn toàn tầng Global Average Pooling (GAP) và Fully Connected (FC) theo Mục 3.1 bài báo.
-    - Trích xuất 3 tầng đặc trưng đa tỉ lệ (Feature Maps) ở các mức độ phân giải:
-      + Tầng C3: Kích thước 76x76, 128 kênh (Stride 8) - Nhận diện đối tượng nhỏ.
-      + Tầng C4: Kích thước 38x38, 256 kênh (Stride 16) - Nhận diện đối tượng vừa.
-      + Tầng C5: Kích thước 19x19, 512 kênh (Stride 32) - Nhận diện đối tượng lớn.
+"""PP-LCNet x1.0-style lightweight backbone."""
 
-PHÂN CÔNG TRÁCH NHIỆM (RACI):
-    - Người thực thi (Responsible): Hưng (Backbone Developer)
-    - Người chịu trách nhiệm (Accountable): T.A (Project Lead)
-    - Tham vấn (Consulted): Sơn (Technical Mentor)
-    - Nhận bàn giao (Informed): Tiến (Tiến nhận C3, C4, C5 để đưa qua Coordinate Attention)
+from __future__ import annotations
 
-GIAO DIỆN & ĐẶC TẢ TENSOR:
-    1. Input:
-       - Tensor ảnh `x`: Kích thước (B, 3, 608, 608), kiểu torch.float32.
-    2. Output:
-       - Tuple gồm 3 tensor: `(C3, C4, C5)`
-         + C3: (B, 128, 76, 76)
-         + C4: (B, 256, 38, 38)
-         + C5: (B, 512, 19, 19)
-
-CẤU TRÚC CHI TIẾT CÁC TẦNG THEO PP-LCNET x1.0:
-    - Stem: Conv 3x3, stride=2, padding=1 (3 -> 16 kênh) -> (B, 16, 304, 304).
-    - Stage 2: 1 khối DepthSepConv k=3, stride=1 (16 -> 32 kênh).
-    - Stage 3: 2 khối DepthSepConv k=3, stride=2 rồi stride=1 (32 -> 64 kênh) -> 152x152.
-    - Stage 4: 2 khối DepthSepConv k=3, stride=2 rồi stride=1 (64 -> 128 kênh) -> Ra C3 (76x76x128).
-    - Stage 5: 1 khối k=3 stride=2 + 5 khối k=5 stride=1 (128 -> 256 kênh) -> Ra C4 (38x38x256).
-    - Stage 6: 2 khối k=5 stride=2 rồi stride=1 tích hợp SEModule (256 -> 512 kênh) -> Ra C5 (19x19x512).
-
-TIÊU CHÍ NGHIỆM THU (DoD M2):
-    [ ] Khi truyền dummy tensor `torch.randn(2, 3, 608, 608)`, shape đầu ra C3, C4, C5 phải đúng 100%.
-    [ ] Số lượng tham số của Backbone đạt xấp xỉ ~1.88M - 2.0M tham số (rất nhẹ so với CSPDarknet53 ~27M).
-    [ ] Tích hợp cơ chế load pretrained weights (chuyển đổi từ PaddleClas nếu có) thông qua hàm `load_pretrained()`.
-
-BẪY LỖI KỸ THUẬT CẦN TRÁNH:
-    - Bẫy 1: Sai lệch số kênh ở C3, C4, C5 sẽ làm gãy interface chuyển tiếp sang Coordinate Attention của Tiến và PB Module của T.A.
-    - Bẫy 2: Hình 1 và 2 trong bài báo Sensors 2023 vẽ thu gọn số khối lặp; Hưng PHẢI tuân thủ theo chuẩn PP-LCNet x1.0 để khớp chuẩn 128/256/512 kênh.
-================================================================================
-"""
-
-import sys
 from pathlib import Path
-
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+from typing import Tuple
 
 import torch
-import torch.nn as nn
-from typing import Tuple
+from torch import nn
+
+try:
+    from .common import ConvBnAct
+except ImportError:  # direct execution: python models/pp_lcnet.py
+    from common import ConvBnAct
 
 
 class SEModule(nn.Module):
-    """
-    Squeeze-and-Excitation Module: Tái cân chỉnh trọng số giữa các kênh.
-    AdaptiveAvgPool2d -> Conv 1x1 giảm kênh (r=4) -> ReLU -> Conv 1x1 tăng kênh -> Hardsigmoid.
-    """
-    def __init__(self, c: int, reduction: int = 4):
+    def __init__(self, channels: int, reduction: int = 4) -> None:
         super().__init__()
-        # TODO: Hưng khởi tạo AdaptiveAvgPool2d(1), Conv2d 1x1, ReLU, Conv2d 1x1, Hardsigmoid
-        raise NotImplementedError("Cần được Hưng cài đặt SEModule.")
+        hidden = max(8, channels // reduction)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, hidden, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, channels, 1),
+            nn.Hardsigmoid(inplace=True),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Cần được Hưng cài đặt forward của SEModule.")
+        return x * self.fc(self.pool(x))
 
 
 class DepthSepConv(nn.Module):
-    """
-    Khối cơ bản của PP-LCNet: DWConv(k x k) -> [SEModule tùy chọn] -> PWConv(1 x 1).
-    Lưu ý: Không dùng residual shortcut theo đúng thiết kế nguyên bản của PP-LCNet.
-    """
-    def __init__(self, c1: int, c2: int, k: int = 3, stride: int = 1, use_se: bool = False):
+    def __init__(self, c1: int, c2: int, k: int = 3, stride: int = 1,
+                 use_se: bool = False) -> None:
         super().__init__()
-        # TODO: Hưng khởi tạo DWConv, BatchNorm, Hardswish, SEModule (nếu use_se), PWConv, BatchNorm, Hardswish
-        raise NotImplementedError("Cần được Hưng cài đặt DepthSepConv.")
+        self.dw = nn.Conv2d(c1, c1, k, stride, k // 2, groups=c1, bias=False)
+        self.dw_bn = nn.BatchNorm2d(c1)
+        self.dw_act = nn.Hardswish(inplace=True)
+        self.se = SEModule(c1) if use_se else nn.Identity()
+        self.pw = nn.Conv2d(c1, c2, 1, bias=False)
+        self.pw_bn = nn.BatchNorm2d(c2)
+        self.pw_act = nn.Hardswish(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Cần được Hưng cài đặt forward của DepthSepConv.")
+        x = self.dw_act(self.dw_bn(self.dw(x)))
+        x = self.se(x)
+        return self.pw_act(self.pw_bn(self.pw(x)))
 
 
 class PPLCNet(nn.Module):
-    """
-    Backbone PP-LCNet x1.0 tối ưu cho di động/biên, trích xuất 3 mức đặc trưng C3, C4, C5.
-    Cắt bỏ hoàn toàn GAP và FC layers theo đúng Mục 3.1 của bài báo.
-    """
-    def __init__(self, pretrained_path: str = None):
+    """Returns C3=(128,76,76), C4=(256,38,38), C5=(512,19,19)."""
+
+    out_channels = (128, 256, 512)
+
+    def __init__(self, pretrained_path: str | Path | None = None) -> None:
         super().__init__()
-        # TODO: Hưng khởi tạo stem, stage2, stage3, stage4, stage5, stage6 theo đặc tả trên
-        raise NotImplementedError("Cần được Hưng cài đặt PPLCNet.")
+        self.stem = ConvBnAct(3, 16, k=3, s=2)
+        self.stage2 = nn.Sequential(DepthSepConv(16, 32, 3, 1))
+        self.stage3 = nn.Sequential(
+            DepthSepConv(32, 64, 3, 2), DepthSepConv(64, 64, 3, 1)
+        )
+        self.stage4 = nn.Sequential(
+            DepthSepConv(64, 128, 3, 2), DepthSepConv(128, 128, 3, 1)
+        )
+        self.stage5 = nn.Sequential(
+            DepthSepConv(128, 256, 3, 2),
+            *(DepthSepConv(256, 256, 5, 1) for _ in range(5)),
+        )
+        self.stage6 = nn.Sequential(
+            DepthSepConv(256, 512, 5, 2, use_se=True),
+            DepthSepConv(512, 512, 5, 1, use_se=True),
+        )
+        if pretrained_path:
+            self.load_pretrained(pretrained_path)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Đầu vào: (B, 3, 608, 608)
-        Đầu ra: Tuple(C3, C4, C5) tương ứng (B, 128, 76, 76), (B, 256, 38, 38), (B, 512, 19, 19)
-        """
-        raise NotImplementedError("Cần được Hưng cài đặt forward của PPLCNet.")
+        x = self.stage2(self.stem(x))
+        x = self.stage3(x)
+        c3 = self.stage4(x)
+        c4 = self.stage5(c3)
+        c5 = self.stage6(c4)
+        return c3, c4, c5
 
-    def load_pretrained(self, path: str) -> None:
-        """
-        Nạp trọng số ImageNet tiền huấn luyện của PP-LCNet.
-        """
-        raise NotImplementedError("Cần được Hưng cài đặt load_pretrained.")
+    def load_pretrained(self, path: str | Path) -> tuple[list[str], list[str]]:
+        payload = torch.load(path, map_location="cpu")
+        state = payload.get("state_dict", payload.get("model", payload)) if isinstance(payload, dict) else payload
+        missing, unexpected = self.load_state_dict(state, strict=False)
+        return list(missing), list(unexpected)
 
 
 if __name__ == "__main__":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-    print(">> [TODO] models/pp_lcnet.py: Hưng cần hoàn thiện PPLCNet để vượt qua Unit Test.")
+    model = PPLCNet().eval()
+    with torch.no_grad():
+        c3, c4, c5 = model(torch.randn(2, 3, 608, 608))
+    assert (c3.shape, c4.shape, c5.shape) == (
+        (2, 128, 76, 76), (2, 256, 38, 38), (2, 512, 19, 19)
+    )
+    print("pp_lcnet.py: PASS")

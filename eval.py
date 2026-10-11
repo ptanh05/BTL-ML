@@ -1,69 +1,106 @@
-"""
-================================================================================
-SCRIPT: eval.py - ĐÁNH GIÁ CHỈ SỐ ĐỊNH LƯỢNG & BENCHMARK NGIỆM THU 6 MÔ HÌNH
-================================================================================
-MỤC ĐÍCH:
-    - Đánh giá toàn diện 6 mô hình trên CÙNG MỘT tập Test chung (`datasets/splits/test.txt`)
-      và trên CÙNG MỘT môi trường phần cứng để đảm bảo tính khách quan khoa học.
-    - Xuất bảng kết quả đối chiếu trực tiếp với:
-      + Bảng 1 bài báo: AP Hat, AP Person, mAP@0.5, Model Size (MB).
-      + Bảng 2 bài báo: Precision, Recall, F1-Score, mAP, FPS, Model Size (so sánh Model-1 vs Model-6).
-    - Xuất file kết quả định dạng Markdown và CSV tại `results/benchmark_table1.csv`
-      và `results/benchmark_table2.csv`.
+"""Evaluate one model or benchmark all six ablation configurations."""
 
-PHÂN CÔNG TRÁCH NHIỆM (RACI):
-    - Người thực thi (Responsible): Tú & Sơn (Evaluation Team)
-    - Người chịu trách nhiệm (Accountable): T.A (Project Lead)
-    - Nhận bàn giao (Informed): Toàn đội (dùng số liệu để viết Báo cáo tổng kết M5)
-
-THAM SỐ DÒNG LỆNH (CLI ARGUMENTS):
-    python eval.py --weights weights/model6_best.pth --config configs/model6.yaml --data configs/dataset.yaml
-    python eval.py --benchmark-all --weights-dir weights/
-
-CÁC BƯỚC THỰC HIỆN:
-    1. Nạp file cấu hình model và khởi tạo mô hình tương ứng.
-    2. Nạp trọng số `.pth` từ file checkpoint.
-    3. Đo dung lượng file trọng số (chỉ tính model state_dict FP32, không tính optimizer).
-    4. Đo FPS: Cho chạy qua 50 ảnh warmup, sau đó đo thời gian trung bình 200 ảnh trên GPU.
-    5. Đánh giá độ chính xác: Cho tập Test đi qua mô hình, áp dụng NMS (iou_thresh=0.45, conf_thresh=0.25).
-    6. Tính toán AP Hat, AP Person, mAP@0.5, Precision, Recall, F1 qua module `utils/metrics.py`.
-    7. Tổng hợp và in bảng kết quả so sánh với chỉ tiêu bài báo gốc.
-
-TIÊU CHÍ NGHIỆM THU (DoD M5):
-    [ ] Tái hiện xu hướng cải tiến rõ rệt: Model-6 đạt mAP cao nhất (~92.98%), kích thước giảm ~83% so với Model-1.
-    [ ] Dung sai kết quả mAP nằm trong khoảng ±1.0% so với Bảng 1.
-    [ ] Tỉ lệ FPS Model-6 / Model-1 đạt xấp xỉ ~1.87x.
-
-BẪY LỖI KỸ THUẬT CẦN TRÁNH:
-    - Bẫy 1: Quên chuyển mô hình sang chế độ đánh giá `model.eval()` và không dùng `with torch.no_grad():`.
-    - Bẫy 2: File .pth chứa cả optimizer state làm dung lượng tăng gấp đôi (hiểu nhầm model nặng gấp đôi).
-      Chỉ đo dung lượng file chứa riêng state_dict của model!
-================================================================================
-"""
+from __future__ import annotations
 
 import argparse
+import csv
 from pathlib import Path
 
+import torch
+import yaml
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Đánh giá chỉ số kiểm định mô hình YOLOv4")
-    parser.add_argument("--weights", type=str, default=None, help="Đường dẫn file trọng số best.pth")
-    parser.add_argument("--config", type=str, default="configs/model6.yaml", help="Đường dẫn file cấu hình model")
-    parser.add_argument("--data", type=str, default="configs/dataset.yaml", help="Đường dẫn file cấu hình dataset")
-    parser.add_argument("--device", type=str, default="cuda", help="Thiết bị thực thi (cuda hoặc cpu)")
-    parser.add_argument("--benchmark-all", action="store_true", help="Chạy đánh giá tự động toàn bộ 6 mô hình")
+from datasets.shwd import build_dataloader
+from models.head import decode_predictions, nms
+from models.yolo import build_model
+from utils.metrics import calculate_map, measure_fps
+
+ROOT = Path(__file__).resolve().parent
+
+
+def _resolve(path: str | Path) -> Path:
+    path = Path(path)
+    return path if path.is_absolute() else ROOT / path
+
+
+def _load_weights(model, path: str | Path, device: torch.device) -> None:
+    payload = torch.load(path, map_location=device)
+    state = payload.get("model", payload.get("state_dict", payload)) if isinstance(payload, dict) else payload
+    model.load_state_dict(state, strict=False)
+
+
+@torch.no_grad()
+def evaluate_model(model, loader, anchors, image_size: int, device: torch.device,
+                   conf: float, iou: float) -> dict[str, float]:
+    model.eval()
+    detections, truths = [], []
+    for images, targets, _ in loader:
+        outputs = model(images.to(device, non_blocking=True))
+        decoded = decode_predictions(outputs, anchors, image_size, conf)
+        for batch_index, rows in enumerate(decoded):
+            detections.append(nms(rows, iou).detach().cpu().numpy())
+            target_rows = targets[targets[:, 0] == batch_index]
+            if target_rows.numel():
+                _, cls, cx, cy, w, h = target_rows.T
+                truths.append(torch.stack([(cx - w / 2) * image_size, (cy - h / 2) * image_size,
+                                            (cx + w / 2) * image_size, (cy + h / 2) * image_size, cls], dim=1).numpy())
+            else:
+                truths.append(torch.zeros((0, 5)).numpy())
+    return calculate_map(detections, truths, num_classes=2)
+
+
+def _write_csv(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    keys = sorted({key for row in rows for key in row})
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=keys); writer.writeheader(); writer.writerows(rows)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate YOLOv4 helmet detector")
+    parser.add_argument("--weights")
+    parser.add_argument("--config", default="configs/model6.yaml")
+    parser.add_argument("--data", default="configs/dataset.yaml")
+    parser.add_argument("--weights-dir", default="weights")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--benchmark-all", action="store_true")
+    parser.add_argument("--conf", type=float, default=0.25)
+    parser.add_argument("--iou", type=float, default=0.5)
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--no-fps", action="store_true")
+    parser.add_argument("--output", default="results")
     return parser.parse_args()
 
 
-def evaluate():
+def evaluate() -> list[dict]:
     args = parse_args()
-    print("=== BẮT ĐẦU ĐÁNH GIÁ CHỈ SỐ MÔ HÌNH ===")
-    # HƯỚNG DẪN CHI TIẾT:
-    # 1. Tú & Sơn nạp tập test từ datasets/shwd.py
-    # 2. Khởi tạo mô hình và nạp trọng số
-    # 3. Tính toán toàn bộ chỉ số thông qua utils/metrics.py
-    # 4. In bảng Markdown và lưu kết quả ra thư mục results/
-    raise NotImplementedError("Script eval.py cần được Tú & Sơn hoàn thiện.")
+    device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
+    data_path = _resolve(args.data)
+    data_cfg = yaml.safe_load(data_path.read_text(encoding="utf-8"))
+    image_size = int(data_cfg.get("img_size", [608, 608])[0])
+    data_root = _resolve(data_cfg.get("data_dir", "dataset"))
+    loader = build_dataloader(data_root, _resolve(data_cfg["test_split"]), image_size, 4, False, 0, args.limit)
+    configs = []
+    if args.benchmark_all:
+        configs = [(i, _resolve(f"configs/model{i}.yaml"), _resolve(args.weights_dir) / f"model_{i}_best.pth") for i in range(1, 7)]
+    else:
+        configs = [(None, _resolve(args.config), _resolve(args.weights) if args.weights else None)]
+    rows = []
+    for model_id, config_path, weights_path in configs:
+        if weights_path is None or not weights_path.exists():
+            print(f"skip {config_path.name}: weights not found ({weights_path})")
+            continue
+        cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        model = build_model(cfg, int(data_cfg.get("num_classes", 2))).to(device)
+        _load_weights(model, weights_path, device)
+        metrics = evaluate_model(model, loader, data_cfg["anchors"], image_size, device, args.conf, args.iou)
+        metrics.update({"model": model_id or cfg.get("model_id", config_path.stem), "size_mb": model.get_model_size_mb(),
+                        "weights_mb": weights_path.stat().st_size / (1024 ** 2)})
+        if not args.no_fps:
+            metrics["fps"] = measure_fps(model, (1, 3, image_size, image_size), str(device), warmup=2, iterations=5)
+        print(metrics)
+        rows.append(metrics)
+    _write_csv(_resolve(args.output) / "benchmark.csv", rows)
+    return rows
 
 
 if __name__ == "__main__":

@@ -1,72 +1,73 @@
-"""
-================================================================================
-MODULE: utils/plots.py - TRỰC QUAN HÓA KẾT QUẢ: LOSS CURVE, PR CURVE & DEMO ẢNH
-================================================================================
-MỤC ĐÍCH:
-    - Xuất các biểu đồ trực quan hóa dữ liệu phục vụ báo cáo khoa học và slide thuyết trình:
-      1. Đồ thị hàm mất mát (Loss Curves): Đối chiếu tốc độ hội tụ giữa CIoU (Model-5)
-         và SIoU (Model-6) theo Hình 9 của bài báo.
-      2. Đường cong Precision-Recall (PR Curve): Cho cả 2 nhãn hat và person theo Hình 8 của bài báo.
-      3. Vẽ hộp bao nhận diện (Bounding Box Overlay): Vẽ nhãn dự đoán (màu xanh cho 'hat',
-         màu đỏ cho 'person') kèm độ tin cậy confidence trên ảnh thực tế theo Hình 11 bài báo.
+"""Plotting and visualisation helpers for M5 evaluation."""
 
-PHÂN CÔNG TRÁCH NHIỆM (RACI):
-    - Người thực thi (Responsible): Tú (Training & Plots Developer)
-    - Người chịu trách nhiệm (Accountable): T.A (Project Lead)
-    - Nhận bàn giao (Informed): Toàn đội (sử dụng hình ảnh để đưa vào Báo cáo tổng kết M5)
+from __future__ import annotations
 
-GIAO DIỆN & ĐẶC TẢ ĐẦU RA:
-    - `plot_loss_comparison(ciou_log_path, siou_log_path, output_png)`:
-      Lưu biểu đồ so sánh Loss tại `results/plots/loss_ciou_vs_siou.png`.
-    - `plot_pr_curve(recalls, precisions, class_names, output_png)`:
-      Lưu biểu đồ PR Curve tại `results/plots/pr_curve.png`.
-    - `visualize_detections(image_path, boxes, labels, scores, output_png)`:
-      Lưu ảnh trực quan hóa bounding box tại `results/detections/`.
-
-TIÊU CHÍ NGHIỆM THU (DoD M5):
-    [ ] Đồ thị thể hiện rõ nét, font chữ dễ đọc, có chú giải Legend, nhãn trục X (Epochs), trục Y (Loss).
-    [ ] Hộp bao vẽ chính xác, nhãn hiển thị rõ ràng trên cả ảnh ban ngày lẫn thiếu sáng.
-================================================================================
-"""
-
+import csv
+import json
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Any
+
+import cv2
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 
 
-def plot_loss_comparison(
-    log_model5: str | Path,
-    log_model6: str | Path,
-    save_path: str | Path = "results/plots/loss_comparison.png"
-) -> None:
-    """
-    Vẽ biểu đồ đối chiếu tốc độ giảm loss giữa Model-5 (CIoU) và Model-6 (SIoU) (Hình 9 bài báo).
-    """
-    raise NotImplementedError("Cần được Tú cài đặt plot_loss_comparison.")
+def _curve(value: str | Path | list[float] | np.ndarray) -> np.ndarray:
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return np.asarray(value, dtype=float)
+    path = Path(value)
+    if path.suffix.lower() == ".json":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            data = data.get("loss", data.get("values", next(iter(data.values()))))
+        return np.asarray(data, dtype=float)
+    if path.suffix.lower() == ".csv":
+        with path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        key = "loss" if rows and "loss" in rows[0] else list(rows[0])[0]
+        return np.asarray([float(row[key]) for row in rows], dtype=float)
+    return np.loadtxt(path, dtype=float)
 
 
-def plot_pr_curve(
-    pr_data: Dict[str, Any],
-    save_path: str | Path = "results/plots/pr_curve.png"
-) -> None:
-    """
-    Vẽ đường cong Precision - Recall cho 2 lớp hat và person (Hình 8 bài báo).
-    """
-    raise NotImplementedError("Cần được Tú cài đặt plot_pr_curve.")
+def plot_loss_comparison(log_model5: str | Path | list[float], log_model6: str | Path | list[float],
+                         save_path: str | Path = "results/plots/loss_comparison.png") -> None:
+    a, b = _curve(log_model5), _curve(log_model6)
+    out = Path(save_path); out.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(8, 5)); plt.plot(a, label="Model-5 CIoU"); plt.plot(b, label="Model-6 SIoU")
+    plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.grid(alpha=0.25); plt.legend(); plt.tight_layout(); plt.savefig(out, dpi=160); plt.close()
 
 
-def draw_bounding_boxes(
-    image: np.ndarray,
-    boxes: np.ndarray,
-    classes: np.ndarray,
-    scores: np.ndarray,
-    save_path: str | Path = None
-) -> np.ndarray:
-    """
-    Vẽ bounding box lên ảnh với màu xanh lá cho 'hat' (0) và màu đỏ cho 'person' (1).
-    """
-    raise NotImplementedError("Cần được Tú cài đặt draw_bounding_boxes.")
+def plot_pr_curve(pr_data: dict[str, Any], save_path: str | Path = "results/plots/pr_curve.png") -> None:
+    out = Path(save_path); out.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(7, 6))
+    for name, values in pr_data.items():
+        if isinstance(values, dict):
+            recall, precision = values["recall"], values["precision"]
+        else:
+            recall, precision = values
+        plt.plot(recall, precision, label=name)
+    plt.xlabel("Recall"); plt.ylabel("Precision"); plt.xlim(0, 1); plt.ylim(0, 1); plt.grid(alpha=0.25); plt.legend(); plt.tight_layout(); plt.savefig(out, dpi=160); plt.close()
 
 
-if __name__ == "__main__":
-    print("[TODO] utils/plots.py: Chạy thử nghiệm vẽ biểu đồ mẫu.")
+def draw_bounding_boxes(image: np.ndarray, boxes: np.ndarray, classes: np.ndarray,
+                        scores: np.ndarray, save_path: str | Path | None = None,
+                        class_names: tuple[str, ...] = ("hat", "person")) -> np.ndarray:
+    canvas = image.copy()
+    colors = ((0, 200, 0), (0, 0, 220))
+    for box, cls, score in zip(np.asarray(boxes), np.asarray(classes), np.asarray(scores)):
+        x1, y1, x2, y2 = [int(round(v)) for v in box[:4]]
+        cls = int(cls); color = colors[cls % len(colors)]
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
+        label = f"{class_names[cls] if cls < len(class_names) else cls}: {float(score):.2f}"
+        (tw, th), base = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        y_text = max(th + base, y1)
+        cv2.rectangle(canvas, (x1, y_text - th - base), (x1 + tw, y_text), color, -1)
+        cv2.putText(canvas, label, (x1, y_text - base), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    if save_path is not None:
+        output = Path(save_path); output.parent.mkdir(parents=True, exist_ok=True); cv2.imwrite(str(output), canvas)
+    return canvas
+
+
+visualize_detections = draw_bounding_boxes

@@ -1,83 +1,104 @@
-"""
-================================================================================
-MODULE: models/head.py - YOLO DETECTION HEAD & GIẢI MÃ BOUNDING BOX
-================================================================================
-MỤC ĐÍCH:
-    - Xây dựng tầng đầu ra phát hiện mục tiêu (YOLOHead) trên 3 tỉ lệ đặc trưng (76x76, 38x38, 19x19).
-    - Cấu hình số kênh đầu ra: `num_anchors * (5 + num_classes)`.
-      Với 2 lớp (`hat` và `person`) và 3 anchors/tầng:
-      Số kênh đầu ra = 3 * (4 tọa độ + 1 objectness + 2 class) = 21 kênh.
-    - Hỗ trợ cờ `dsc`: Sử dụng DSConv (Model-2..6) hoặc Conv 3x3 chuẩn (Model-1).
+"""YOLO detection head, decoding and class-aware NMS."""
 
-PHÂN CÔNG TRÁCH NHIỆM (RACI):
-    - Người thực thi (Responsible): Tú (Loss & Head Developer)
-    - Người chịu trách nhiệm (Accountable): T.A (Project Lead)
-================================================================================
-"""
+from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+from typing import Iterable
 
 import torch
-import torch.nn as nn
-from typing import List, Tuple
+import torch.nn.functional as F
+from torch import nn
+
+try:
+    from .common import conv3x3
+except ImportError:  # direct execution: python models/head.py
+    from common import conv3x3
 
 
 class YOLOHead(nn.Module):
-    """
-    Detection Head cho 3 mức tỉ lệ đặc trưng:
-    Mỗi nhánh gồm: DSConv (hoặc Conv 3x3) -> Conv 1x1 ra 21 kênh.
-    """
-    def __init__(
-        self,
-        in_channels: Tuple[int, int, int],
-        num_classes: int = 2,
-        num_anchors: int = 3,
-        dsc: bool = True
-    ):
+    def __init__(self, in_channels: Iterable[int], num_classes: int = 2,
+                 num_anchors: int = 3, dsc: bool = True) -> None:
         super().__init__()
         self.num_classes = num_classes
         self.num_anchors = num_anchors
-        self.out_channels = num_anchors * (5 + num_classes)  # = 21
-        # TODO: Tú khởi tạo nn.ModuleList chứa các nhánh conv3x3 và conv 1x1
-        raise NotImplementedError("Cần được Tú (Loss & Head Developer) cài đặt YOLOHead.")
+        out_channels = num_anchors * (5 + num_classes)
+        self.heads = nn.ModuleList([
+            nn.Sequential(conv3x3(c, 2 * c, dsc=dsc), nn.Conv2d(2 * c, out_channels, 1))
+            for c in in_channels
+        ])
 
-    def forward(self, *feats: torch.Tensor) -> List[torch.Tensor]:
-        """
-        Nhận 3 feature maps (từ Neck), trả về 3 tensor dự đoán có kênh = 21.
-        """
-        raise NotImplementedError("Cần được Tú cài đặt forward của YOLOHead.")
-
-
-def decode_box_predictions(
-    predictions: List[torch.Tensor],
-    anchors: torch.Tensor,
-    strides: List[int] = [8, 16, 32]
-) -> torch.Tensor:
-    """
-    Giải mã dự đoán thô từ head thành bounding boxes chuẩn hóa [cx, cy, w, h] hoặc [x1, y1, x2, y2].
-    """
-    raise NotImplementedError("Cần được Tú cài đặt decode_box_predictions.")
+    def forward(self, *features: torch.Tensor) -> list[torch.Tensor]:
+        return [head(feature) for head, feature in zip(self.heads, features)]
 
 
-def non_max_suppression(
-    prediction: torch.Tensor,
-    conf_thres: float = 0.25,
-    iou_thres: float = 0.45
-) -> List[torch.Tensor]:
-    """
-    Thực hiện NMS loại bỏ các hộp bao trùng lặp dựa trên IoU threshold.
-    """
-    raise NotImplementedError("Cần được Tú cài đặt non_max_suppression.")
+def _xywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
+    cx, cy, w, h = boxes.unbind(-1)
+    return torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1)
+
+
+def decode_predictions(preds: list[torch.Tensor], anchors: list, img_size: int = 608,
+                       conf_thres: float = 0.25) -> list[torch.Tensor]:
+    """Decode raw feature maps into one ``(N,6)`` tensor per image."""
+    decoded: list[torch.Tensor] = []
+    batch_size = preds[0].shape[0]
+    per_image = [[] for _ in range(batch_size)]
+    for level, pred in enumerate(preds):
+        b, _, h, w = pred.shape
+        n_anchors = len(anchors[level])
+        n_values = pred.shape[1] // n_anchors
+        stride_y, stride_x = img_size / h, img_size / w
+        raw = pred.view(b, n_anchors, n_values, h, w).permute(0, 1, 3, 4, 2)
+        gy, gx = torch.meshgrid(
+            torch.arange(h, device=pred.device), torch.arange(w, device=pred.device), indexing="ij"
+        )
+        grid = torch.stack((gx, gy), dim=-1).view(1, 1, h, w, 2).float()
+        anchor = torch.as_tensor(anchors[level], device=pred.device, dtype=pred.dtype).view(1, n_anchors, 1, 1, 2)
+        xy = (raw[..., :2].sigmoid() + grid) * raw.new_tensor([stride_x, stride_y])
+        wh = raw[..., 2:4].clamp(-10, 10).exp() * anchor
+        obj = raw[..., 4:5].sigmoid()
+        cls_prob = raw[..., 5:].sigmoid()
+        scores, labels = cls_prob.max(dim=-1, keepdim=True)
+        scores = scores * obj
+        boxes = _xywh_to_xyxy(torch.cat([xy, wh], dim=-1))
+        rows = torch.cat([boxes, scores, labels.float()], dim=-1).view(b, -1, 6)
+        for i in range(batch_size):
+            per_image[i].append(rows[i][rows[i, :, 4] >= conf_thres])
+    for rows in per_image:
+        decoded.append(torch.cat(rows, dim=0) if rows else preds[0].new_zeros((0, 6)))
+    return decoded
+
+
+def box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    if boxes1.numel() == 0 or boxes2.numel() == 0:
+        return boxes1.new_zeros((boxes1.shape[0], boxes2.shape[0]))
+    lt = torch.maximum(boxes1[:, None, :2], boxes2[None, :, :2])
+    rb = torch.minimum(boxes1[:, None, 2:], boxes2[None, :, 2:])
+    inter = (rb - lt).clamp(min=0).prod(dim=-1)
+    area1 = (boxes1[:, 2:] - boxes1[:, :2]).clamp(min=0).prod(dim=-1)
+    area2 = (boxes2[:, 2:] - boxes2[:, :2]).clamp(min=0).prod(dim=-1)
+    return inter / (area1[:, None] + area2[None, :] - inter + 1e-7)
+
+
+def nms(boxes: torch.Tensor, iou_thres: float = 0.45, max_det: int = 300) -> torch.Tensor:
+    """Class-aware NMS for ``[x1,y1,x2,y2,score,class_id]`` rows."""
+    if boxes.numel() == 0:
+        return boxes.reshape(0, 6)
+    keep: list[torch.Tensor] = []
+    for cls in boxes[:, 5].unique():
+        subset = boxes[boxes[:, 5] == cls]
+        order = subset[:, 4].argsort(descending=True)
+        while order.numel():
+            idx = order[0]
+            keep.append(subset[idx])
+            if order.numel() == 1:
+                break
+            overlaps = box_iou(subset[idx:idx + 1, :4], subset[order[1:], :4]).squeeze(0)
+            order = order[1:][overlaps <= iou_thres]
+    result = torch.stack(keep) if keep else boxes.new_zeros((0, 6))
+    return result[result[:, 4].argsort(descending=True)[:max_det]]
 
 
 if __name__ == "__main__":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-    print(">> [TODO] models/head.py: Tú cần hoàn thiện YOLOHead và hàm decode để vượt qua Unit Test.")
+    head = YOLOHead((128, 128, 128))
+    outputs = head(torch.randn(1, 128, 76, 76), torch.randn(1, 128, 38, 38), torch.randn(1, 128, 19, 19))
+    assert [tuple(o.shape) for o in outputs] == [(1, 21, 76, 76), (1, 21, 38, 38), (1, 21, 19, 19)]
+    print("head.py: PASS")

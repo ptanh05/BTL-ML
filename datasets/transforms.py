@@ -1,93 +1,84 @@
-"""
-================================================================================
-MODULE: datasets/transforms.py - TIỀN XỬ LÝ & TĂNG CƯỜNG DỮ LIỆU (AUGMENTATION)
-================================================================================
-MỤC ĐÍCH:
-    - Cung cấp pipeline tiền xử lý ảnh và nhãn cho mô hình YOLOv4 với kích thước cố định 608x608.
-    - Hỗ trợ Letterbox Resize (giữ nguyên tỷ lệ khung hình, bù viền xám 114) để tránh méo ảnh.
-    - Cung cấp các phép biến đổi tăng cường dữ liệu khi huấn luyện:
-      + Lật ngang ảnh ngẫu nhiên (Horizontal Flip với xác suất 50%).
-      + Biến đổi không gian màu HSV (Hue, Saturation, Value).
-      + Chuẩn hóa giá trị điểm ảnh về khoảng [0.0, 1.0].
-    - Pipeline riêng biệt cho Validation & Test: Chỉ thực hiện Letterbox resize + Normalize.
+"""Image/box transforms for the SHWD detection dataset."""
 
-PHÂN CÔNG TRÁCH NHIỆM (RACI):
-    - Người thực thi (Responsible): Sơn (Technical Mentor)
-    - Người chịu trách nhiệm (Accountable): T.A (Project Lead)
-    - Nhận bàn giao (Informed): Toàn đội (sử dụng chung transform cho cả 6 mô hình)
+from __future__ import annotations
 
-GIAO DIỆN & ĐẶC TẢ DỮ LIỆU:
-    1. Input:
-       - image: Ảnh gốc dạng numpy array (H, W, 3) kênh RGB hoặc PIL Image.
-       - bboxes: Ma trận bounding box dạng numpy array (N, 4) [x1, y1, x2, y2]
-         hoặc [cx, cy, w, h] kèm nhãn lớp classes (N,).
-    2. Output:
-       - image_tensor: torch.Tensor có kích thước cố định (3, 608, 608), kiểu torch.float32, giá trị [0.0, 1.0].
-       - target_boxes: Bounding boxes đã được scale và offset tọa độ theo đúng tỷ lệ Letterbox.
+from typing import Iterable
 
-HƯỚNG DẪN CÀI ĐẶT:
-    1. `letterbox_image(image, target_size=(608, 608), pad_color=(114, 114, 114))`:
-       - Tính tỷ lệ scale: r = min(target_h / h, target_w / w).
-       - Resize ảnh theo r, tính padding dw, dh để bù viền cân đối 2 bên.
-       - Cập nhật lại tọa độ bounding box tương ứng: x' = x * r + dw, y' = y * r + dh.
-    2. `get_train_transforms(img_size=608)`:
-       - Trả về đối tượng Albumentations Compose hoặc PyTorch transform cho tập Train.
-    3. `get_val_transforms(img_size=608)`:
-       - Trả về transform chuẩn cho tập Val và Test (chỉ letterbox + normalize, không flip/jitter).
-
-TIÊU CHÍ NGHIỆM THU (DoD M1):
-    [ ] Ảnh đầu ra luôn đúng kích thước (3, 608, 608).
-    [ ] Tọa độ bounding box sau biến đổi không bị tràn ra ngoài kích thước 608x608.
-    [ ] Bbox sau biến đổi vẫn bao chính xác mục tiêu trên ảnh (kiểm tra bằng unit test vẽ bbox).
-
-BẪY LỖI KỸ THUẬT CẦN TRÁNH:
-    - Bẫy 1: Không scale tọa độ bounding box khi resize ảnh -> Model học sai nhãn hoàn toàn!
-    - Bẫy 2: OpenCV đọc ảnh mặc định là BGR, PyTorch và Albumentations mong đợi RGB. Phải chuyển đổi màu `cv2.cvtColor(img, cv2.COLOR_BGR2RGB)`.
-================================================================================
-"""
-
+import cv2
 import numpy as np
 import torch
-from typing import Tuple, Any
 
 
-def letterbox(
-    image: np.ndarray,
-    target_size: Tuple[int, int] = (608, 608),
-    pad_color: Tuple[int, int, int] = (114, 114, 114)
-) -> Tuple[np.ndarray, float, Tuple[int, int]]:
-    """
-    Resize ảnh kèm bù viền (letterboxing) để bảo toàn tỷ lệ khung hình (aspect ratio).
-    
-    Args:
-        image: Ảnh gốc RGB (H, W, 3).
-        target_size: (target_height, target_width), mặc định (608, 608).
-        pad_color: Giá trị RGB của phần bù viền, mặc định xám (114, 114, 114).
-        
-    Returns:
-        padded_image: Ảnh sau letterbox (target_h, target_w, 3).
-        ratio: Tỷ lệ co giãn r.
-        (pad_w, pad_h): Giá trị bù viền theo chiều ngang và dọc.
-    """
-    # HƯỚNG DẪN: Sơn triển khai thuật toán tính ratio và cv2.copyMakeBorder tại đây
-    raise NotImplementedError("Chức năng letterbox cần được Sơn (Mentor) hoàn thiện.")
+def letterbox(image: np.ndarray, size: int | tuple[int, int] = 608,
+              color: tuple[int, int, int] = (114, 114, 114)) -> tuple[np.ndarray, float, tuple[float, float]]:
+    if isinstance(size, int):
+        target_h, target_w = size, size
+    else:
+        target_h, target_w = size
+    h, w = image.shape[:2]
+    ratio = min(target_w / w, target_h / h)
+    new_w, new_h = int(round(w * ratio)), int(round(h * ratio))
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    dw, dh = (target_w - new_w) / 2, (target_h - new_h) / 2
+    padded = cv2.copyMakeBorder(
+        resized, int(round(dh - 0.1)), int(round(dh + 0.1)),
+        int(round(dw - 0.1)), int(round(dw + 0.1)), cv2.BORDER_CONSTANT, value=color,
+    )
+    return padded, ratio, (dw, dh)
 
 
-def get_train_transforms(img_size: int = 608) -> Any:
-    """
-    Khởi tạo pipeline tăng cường dữ liệu cho tập huấn luyện (Train).
-    """
-    # HƯỚNG DẪN: Khởi tạo albumentations.Compose với HorizontalFlip, ColorJitter, Normalize...
-    raise NotImplementedError("Chức năng get_train_transforms cần được Sơn hoàn thiện.")
+def xyxy_to_normalized_xywh(boxes: np.ndarray, image_shape: tuple[int, int]) -> np.ndarray:
+    h, w = image_shape
+    if boxes.size == 0:
+        return boxes.reshape(0, 4).astype(np.float32)
+    x1, y1, x2, y2 = boxes.T
+    return np.stack(((x1 + x2) / 2 / w, (y1 + y2) / 2 / h,
+                     (x2 - x1) / w, (y2 - y1) / h), axis=1).astype(np.float32)
 
 
-def get_val_transforms(img_size: int = 608) -> Any:
-    """
-    Khởi tạo pipeline tiền xử lý cho tập kiểm định (Val) và đánh giá (Test).
-    """
-    # HƯỚNG DẪN: Chỉ chuẩn hóa Normalize và đưa về tensor, không thêm nhiễu/lật
-    raise NotImplementedError("Chức năng get_val_transforms cần được Sơn hoàn thiện.")
+def normalized_xywh_to_xyxy(boxes: np.ndarray, image_shape: tuple[int, int]) -> np.ndarray:
+    h, w = image_shape
+    if boxes.size == 0:
+        return boxes.reshape(0, 4).astype(np.float32)
+    cx, cy, bw, bh = boxes.T
+    return np.stack(((cx - bw / 2) * w, (cy - bh / 2) * h,
+                     (cx + bw / 2) * w, (cy + bh / 2) * h), axis=1).astype(np.float32)
+
+
+class DetectionTransform:
+    def __init__(self, image_size: int = 608, train: bool = False) -> None:
+        self.image_size = image_size
+        self.train = train
+
+    def __call__(self, image: np.ndarray, boxes: np.ndarray, labels: np.ndarray):
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        h, w = image.shape[:2]
+        if self.train and np.random.rand() < 0.5:
+            image = image[:, ::-1].copy()
+            if boxes.size:
+                boxes = boxes.copy()
+                boxes[:, [0, 2]] = w - boxes[:, [2, 0]]
+        image, ratio, (dw, dh) = letterbox(image, self.image_size)
+        if boxes.size:
+            boxes = boxes.copy().astype(np.float32)
+            boxes[:, [0, 2]] = boxes[:, [0, 2]] * ratio + dw
+            boxes[:, [1, 3]] = boxes[:, [1, 3]] * ratio + dh
+            boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, self.image_size)
+            boxes[:, [1, 3]] = boxes[:, [1, 3]].clip(0, self.image_size)
+        boxes = xyxy_to_normalized_xywh(boxes, (self.image_size, self.image_size))
+        image = image.astype(np.float32) / 255.0
+        tensor = torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1)))
+        return tensor, torch.from_numpy(boxes), torch.from_numpy(labels.astype(np.int64))
+
+
+def build_transforms(image_size: int = 608, train: bool = False) -> DetectionTransform:
+    return DetectionTransform(image_size=image_size, train=train)
 
 
 if __name__ == "__main__":
-    print("[TODO] datasets/transforms.py: Chạy unit test kiểm tra letterbox và bounding box coordinate shift.")
+    image = np.zeros((300, 500, 3), dtype=np.uint8)
+    boxes = np.array([[10, 20, 100, 200]], dtype=np.float32)
+    labels = np.array([0])
+    tensor, transformed, out_labels = DetectionTransform(train=False)(image, boxes, labels)
+    assert tensor.shape == (3, 608, 608) and transformed.shape == (1, 4)
+    print("transforms.py: PASS")

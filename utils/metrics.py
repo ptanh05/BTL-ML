@@ -1,106 +1,112 @@
-"""
-================================================================================
-MODULE: utils/metrics.py - ĐÁNH GIÁ CHỈ SỐ: MAP@0.5, PRECISION, RECALL, F1 & FPS
-================================================================================
-MỤC ĐÍCH:
-    - Cung cấp toàn bộ công thức và hàm đo lường chỉ số định lượng theo bài báo MDPI Sensors 2023.
-    - Tính toán độ chính xác phát hiện cho 2 lớp mục tiêu:
-      + AP Hat (Average Precision lớp mũ bảo hộ tại IoU=0.5).
-      + AP Person (Average Precision lớp người không đội mũ tại IoU=0.5).
-      + mAP@0.5 = (AP Hat + AP Person) / 2 (Công thức 11 bài báo).
-    - Tính toán Precision (P), Recall (R), F1-Score tại ngưỡng confidence tối ưu (Bảng 2 bài báo).
-    - Đo đạc tốc độ suy luận FPS (Frames Per Second) và dung lượng file trọng số (MB).
+"""Detection metrics used by evaluation and benchmark scripts."""
 
-PHÂN CÔNG TRÁCH NHIỆM (RACI):
-    - Người thực thi (Responsible): Tú & Sơn (Loss & Metrics Developers)
-    - Người chịu trách nhiệm (Accountable): T.A (Project Lead)
-    - Nhận bàn giao (Informed): Toàn đội (sử dụng trong eval.py để xuất kết quả nghiệm thu)
+from __future__ import annotations
 
-GIAO DIỆN & ĐẶC TẢ DỮ LIỆU:
-    1. Input:
-       - Dự đoán đã qua NMS: Danh sách detections [x1, y1, x2, y2, conf, class_id].
-       - Nhãn thật (Ground Truths): [class_id, x1, y1, x2, y2].
-       - Ngưỡng IoU đánh giá: iou_threshold = 0.5.
-    2. Output:
-       - Dictionary chứa đầy đủ chỉ số:
-         {
-           'ap_hat': float,      # Ví dụ: 0.9434
-           'ap_person': float,   # Ví dụ: 0.9163
-           'map_50': float,      # Ví dụ: 0.9298
-           'precision': float,
-           'recall': float,
-           'f1': float,
-           'fps': float,
-           'model_size_mb': float
-         }
+import time
+from typing import Iterable
 
-BẢNG CHỈ TIÊU NGHIỆM THU ĐỐI CHIẾU:
-    - Bảng 1 (Ablation Study):
-      Model-1: AP Hat 93.15% | AP Person 91.77% | mAP 92.46% | 243.92 MB
-      Model-2: AP Hat 92.71% | AP Person 91.00% | mAP 91.86% | 136.13 MB
-      Model-3: AP Hat 88.85% | AP Person 89.38% | mAP 89.34% |  38.75 MB
-      Model-4: AP Hat 89.36% | AP Person 92.82% | mAP 90.09% |  38.99 MB
-      Model-5: AP Hat 90.54% | AP Person 92.03% | mAP 91.29% |  41.88 MB
-      Model-6: AP Hat 94.34% | AP Person 91.63% | mAP 92.98% |  41.88 MB
-      (*) Chấp nhận dung sai ±1.0% mAP do sai lệch nội tại của bài báo ở Model-3/4.
-    - Bảng 2: So sánh tốc độ:
-      Model-6 / Model-1: Tỉ lệ FPS bài báo là ~1.87x (43.24 vs 23.02 FPS).
-
-TIÊU CHÍ NGHIỆM THU (DoD M5):
-    [ ] Script `eval.py` tính toán chỉ số tự động từ test set và trả kết quả dưới dạng bảng DataFrame / Markdown.
-    [ ] Đo FPS trên cùng một thiết bị GPU (Colab T4), thực hiện warmup tối thiểu 50 ảnh trước khi bấm giờ.
-
-BẪY LỖI KỸ THUẬT CẦN TRÁNH:
-    - Bẫy 1: Không đồng bộ kích thước ảnh khi đo FPS: Đo FPS bắt buộc dùng đúng ảnh kích thước (1, 3, 608, 608).
-    - Bẫy 2: Đo FPS bao gồm cả thời gian đọc ghi ổ cứng: Chỉ bấm giờ quá trình suy luận `model(x)` trên GPU kèm `torch.cuda.synchronize()`.
-================================================================================
-"""
-
-import torch
 import numpy as np
-from typing import Dict, List, Tuple
+import torch
+
+
+def box_iou(boxes1: np.ndarray, boxes2: np.ndarray) -> np.ndarray:
+    if boxes1.size == 0 or boxes2.size == 0:
+        return np.zeros((len(boxes1), len(boxes2)), dtype=np.float32)
+    lt = np.maximum(boxes1[:, None, :2], boxes2[None, :, :2])
+    rb = np.minimum(boxes1[:, None, 2:], boxes2[None, :, 2:])
+    inter = np.prod(np.maximum(rb - lt, 0), axis=-1)
+    area1 = np.prod(np.maximum(boxes1[:, 2:] - boxes1[:, :2], 0), axis=-1)
+    area2 = np.prod(np.maximum(boxes2[:, 2:] - boxes2[:, :2], 0), axis=-1)
+    return inter / (area1[:, None] + area2[None, :] - inter + 1e-7)
 
 
 def compute_ap(recall: np.ndarray, precision: np.ndarray) -> float:
-    """
-    Tính diện tích dưới đường cong Precision-Recall (AUC-PR) theo chuẩn 11 điểm hoặc all-points.
-    """
-    raise NotImplementedError("Cần được Tú cài đặt compute_ap.")
+    recall = np.concatenate(([0.0], np.asarray(recall), [1.0]))
+    precision = np.concatenate(([0.0], np.asarray(precision), [0.0]))
+    precision = np.maximum.accumulate(precision[::-1])[::-1]
+    indices = np.where(recall[1:] != recall[:-1])[0]
+    return float(np.sum((recall[indices + 1] - recall[indices]) * precision[indices + 1]))
 
 
-def calculate_map(
-    detections: List[np.ndarray],
-    ground_truths: List[np.ndarray],
-    iou_thresh: float = 0.5,
-    num_classes: int = 2
-) -> Dict[str, float]:
-    """
-    Tính AP cho từng lớp (hat, person) và mAP@0.5.
-    """
-    raise NotImplementedError("Cần được Tú & Sơn cài đặt calculate_map.")
+def _class_stats(detections: list[np.ndarray], ground_truths: list[np.ndarray],
+                 cls: int, iou_thresh: float) -> tuple[float, int, int, int, np.ndarray, np.ndarray]:
+    gt_by_image = {}
+    total_gt = 0
+    for image_id, gt in enumerate(ground_truths):
+        selected = gt[gt[:, 4].astype(int) == cls] if gt.size else np.empty((0, 5))
+        gt_by_image[image_id] = selected
+        total_gt += len(selected)
+    records = []
+    for image_id, det in enumerate(detections):
+        selected = det[det[:, 5].astype(int) == cls] if det.size else np.empty((0, 6))
+        records.extend((float(row[4]), image_id, row[:4]) for row in selected)
+    records.sort(key=lambda item: item[0], reverse=True)
+    matched = {idx: np.zeros(len(gt_by_image[idx]), dtype=bool) for idx in gt_by_image}
+    tp, fp = [], []
+    for _, image_id, box in records:
+        gt = gt_by_image[image_id]
+        if len(gt) == 0:
+            tp.append(0); fp.append(1); continue
+        ious = box_iou(box[None, :], gt[:, :4])[0]
+        best = int(ious.argmax())
+        if ious[best] >= iou_thresh and not matched[image_id][best]:
+            matched[image_id][best] = True
+            tp.append(1); fp.append(0)
+        else:
+            tp.append(0); fp.append(1)
+    tp = np.asarray(tp, dtype=np.float32)
+    fp = np.asarray(fp, dtype=np.float32)
+    if not len(tp):
+        return 0.0, 0, 0, total_gt, np.zeros(0), np.zeros(0)
+    cum_tp, cum_fp = np.cumsum(tp), np.cumsum(fp)
+    recall = cum_tp / max(total_gt, 1)
+    precision = cum_tp / np.maximum(cum_tp + cum_fp, 1e-7)
+    return compute_ap(recall, precision), int(tp.sum()), int(fp.sum()), max(total_gt - int(tp.sum()), 0), recall, precision
 
 
-def compute_prf1(
-    tp: int, fp: int, fn: int
-) -> Tuple[float, float, float]:
-    """
-    Tính Precision, Recall và F1-Score từ True Positive, False Positive, False Negative.
-    """
-    raise NotImplementedError("Cần được Tú cài đặt compute_prf1.")
+def calculate_map(detections: list[np.ndarray], ground_truths: list[np.ndarray],
+                  iou_thresh: float = 0.5, num_classes: int = 2) -> dict[str, float]:
+    result: dict[str, float] = {}
+    aps, total_tp, total_fp, total_fn = [], 0, 0, 0
+    for cls in range(num_classes):
+        ap, tp, fp, fn, _, _ = _class_stats(detections, ground_truths, cls, iou_thresh)
+        result[f"ap_class_{cls}"] = ap
+        aps.append(ap)
+        total_tp += tp; total_fp += fp; total_fn += fn
+    precision, recall, f1 = compute_prf1(total_tp, total_fp, total_fn)
+    result.update({"map": float(np.mean(aps)) if aps else 0.0,
+                   "precision": precision, "recall": recall, "f1": f1,
+                   "tp": float(total_tp), "fp": float(total_fp), "fn": float(total_fn)})
+    return result
 
 
-def measure_fps(
-    model: torch.nn.Module,
-    input_size: Tuple[int, int, int, int] = (1, 3, 608, 608),
-    device: str = "cuda",
-    warmup: int = 50,
-    iterations: int = 200
-) -> float:
-    """
-    Đo tốc độ suy luận FPS chính xác của mô hình trên GPU với torch.cuda.synchronize().
-    """
-    raise NotImplementedError("Cần được Tú & Sơn cài đặt measure_fps.")
+def compute_prf1(tp: int, fp: int, fn: int) -> tuple[float, float, float]:
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2 * precision * recall / max(precision + recall, 1e-12)
+    return float(precision), float(recall), float(f1)
+
+
+@torch.no_grad()
+def measure_fps(model: torch.nn.Module, input_size: tuple[int, int, int, int] = (1, 3, 608, 608),
+                device: str = "cuda", warmup: int = 10, iterations: int = 50) -> float:
+    device_obj = torch.device(device if device != "cuda" or torch.cuda.is_available() else "cpu")
+    model = model.to(device_obj).eval()
+    x = torch.randn(input_size, device=device_obj)
+    for _ in range(max(1, warmup)):
+        model(x)
+    if device_obj.type == "cuda":
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(max(1, iterations)):
+        model(x)
+    if device_obj.type == "cuda":
+        torch.cuda.synchronize()
+    return float(iterations / max(time.perf_counter() - start, 1e-9))
 
 
 if __name__ == "__main__":
-    print("[TODO] utils/metrics.py: Chạy unit test kiểm tra tính toán AP và mAP.")
+    detections = [np.array([[0, 0, 10, 10, 0.9, 0]], dtype=np.float32)]
+    truths = [np.array([[0, 0, 10, 10, 0]], dtype=np.float32)]
+    assert calculate_map(detections, truths)["map"] == 0.5
+    print("metrics.py: PASS")

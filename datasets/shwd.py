@@ -1,114 +1,158 @@
-"""
-================================================================================
-MODULE: datasets/shwd.py - PYTORCH DATASET & DATALOADER CHO SHWD
-================================================================================
-MỤC ĐÍCH:
-    - Xây dựng lớp `SHWDDataset(torch.utils.data.Dataset)` để nạp ảnh và nhãn.
-    - Hỗ trợ cả định dạng Pascal VOC (.xml) hoặc YOLO (.txt).
-    - Cung cấp hàm `collate_fn` chuyên biệt để gom batch khi mỗi ảnh có số lượng bounding box khác nhau.
-    - Cung cấp hàm `build_dataloader` tạo DataLoader tối ưu với đa luồng (num_workers), pin_memory trên GPU Colab.
+"""Pascal-VOC/YOLO loader for the Safety Helmet Wearing Dataset."""
 
-PHÂN CÔNG TRÁCH NHIỆM (RACI):
-    - Người thực thi (Responsible): Sơn (Technical Mentor)
-    - Người chịu trách nhiệm (Accountable): T.A (Project Lead)
-    - Tham vấn (Consulted): Tú (đảm bảo định dạng target khớp với hàm loss)
-    - Nhận bàn giao (Informed): Toàn đội (Hưng, Tiến, Tú dùng để train và test)
+from __future__ import annotations
 
-GIAO DIỆN & ĐẶC TẢ DỮ LIỆU:
-    1. Input:
-       - `split_file`: Đường dẫn file danh sách ảnh (train.txt / val.txt / test.txt).
-       - `img_size`: (608, 608).
-       - `is_train`: bool (True khi huấn luyện để bật augmentation).
-    2. Output:
-       - Mỗi phần tử `dataset[i]` trả về:
-         + `image`: torch.Tensor kích thước (3, 608, 608), dtype=torch.float32.
-         + `targets`: torch.Tensor kích thước (N, 5) gồm [class_id, cx, cy, w, h] chuẩn hóa [0, 1].
-       - Khi nạp qua `DataLoader(collate_fn=yolo_collate_fn)`:
-         + `images_batch`: torch.Tensor (B, 3, 608, 608).
-         + `targets_batch`: torch.Tensor (M, 6) gồm [image_idx_in_batch, class_id, cx, cy, w, h].
-
-HƯỚNG DẪN CÀI ĐẶT:
-    1. Lớp `SHWDDataset`:
-       - `__init__`: Đọc danh sách đường dẫn ảnh từ file `.txt`. Tìm file nhãn tương ứng (cùng tên, khác đuôi .xml hoặc .txt).
-       - `__len__`: Trả về tổng số ảnh trong tập.
-       - `__getitem__(index)`:
-         * Đọc ảnh bằng OpenCV hoặc PIL.
-         * Đọc tọa độ và nhãn lớp từ file nhãn (hat = 0, person = 1).
-         * Áp dụng `transforms` (Letterbox resize 608x608).
-         * Trả về (image, targets).
-    2. Hàm `yolo_collate_fn(batch)`:
-       - Tách riêng danh sách images và targets.
-       - Ghép images thành tensor (B, 3, 608, 608).
-       - Thêm cột `batch_idx` vào targets và ghép lại thành tensor (M, 6).
-    3. Hàm `build_dataloader(split_file, batch_size, is_train=True, num_workers=4)`:
-       - Trả về đối tượng `torch.utils.data.DataLoader`.
-
-TIÊU CHÍ NGHIỆM THU (DoD M1):
-    [ ] Chạy thử nạp 1 batch: shape `images` phải là `(B, 3, 608, 608)`.
-    [ ] Shape `targets` phải là `(M, 6)` với nhãn class chỉ gồm 0 hoặc 1.
-    [ ] Tốc độ nạp dữ liệu mượt mà, không bị hiện tượng CPU bottleneck nghẽn GPU.
-
-BẪY LỖI KỸ THUẬT CẦN TRÁNH:
-    - Bẫy 1: Ảnh không có bounding box nào (ảnh âm tính): Phải xử lý trả về targets rỗng shape (0, 5) chứ không được crash!
-    - Bẫy 2: Lỗi pin_memory khi bộ nhớ RAM Colab bị đầy: Đặt `pin_memory=True` chỉ khi GPU khả dụng.
-================================================================================
-"""
-
+import os
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import List, Tuple, Any
+from typing import Callable
+
+import cv2
+import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
+
+from .transforms import build_transforms
+
+CLASS_NAMES = ("hat", "person")
+CLASS_TO_ID = {name: idx for idx, name in enumerate(CLASS_NAMES)}
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+
+
+def _read_split(path: str | Path) -> list[str]:
+    return [line.strip() for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
 class SHWDDataset(Dataset):
-    """
-    Dataset nạp ảnh và nhãn mũ bảo hộ Safety Helmet Wearing Dataset (SHWD).
-    """
-    def __init__(
-        self,
-        split_file: str | Path,
-        img_size: int = 608,
-        is_train: bool = True
-    ):
-        self.split_file = Path(split_file)
-        self.img_size = img_size
-        self.is_train = is_train
-        # HƯỚNG DẪN: Sơn nạp danh sách đường dẫn ảnh từ split_file
-        pass
+    def __init__(self, data_root: str | Path = "dataset", split_file: str | Path | None = None,
+                 image_size: int = 608, train: bool = False,
+                 transform: Callable | None = None, limit: int | None = None) -> None:
+        self.data_root = Path(data_root).resolve()
+        self.project_root = self.data_root.parent
+        self.annotation_root = self.data_root / "annotations"
+        self.transform = transform or build_transforms(image_size, train=train)
+        self.train = train
+        if split_file is None:
+            split_file = self.project_root / "datasets" / "splits" / ("train.txt" if train else "val.txt")
+        split_path = Path(split_file)
+        if not split_path.is_absolute():
+            split_path = self.project_root / split_path
+        self.items = self._resolve_items(_read_split(split_path))
+        if limit is not None:
+            self.items = self.items[:limit]
+        if not self.items:
+            raise RuntimeError(f"No images found for split {split_path} under {self.data_root}")
+
+    def _resolve_items(self, entries: list[str]) -> list[Path]:
+        result: list[Path] = []
+        for entry in entries:
+            raw = Path(entry.replace("\\", os.sep))
+            candidates = []
+            if raw.is_absolute():
+                candidates.append(raw)
+            candidates.extend([
+                self.project_root / raw,
+                self.data_root / raw,
+                self.data_root / "train" / raw.name,
+                self.data_root / "val" / raw.name,
+                self.data_root / "test" / raw.name,
+            ])
+            found = next((p for p in candidates if p.is_file()), None)
+            if found is not None:
+                result.append(found)
+        return result
+
+    def _annotation_path(self, image_path: Path) -> Path | None:
+        candidates = [
+            self.annotation_root / f"{image_path.stem}.xml",
+            image_path.with_suffix(".xml"),
+            image_path.with_suffix(".txt"),
+            self.data_root / "labels" / f"{image_path.stem}.txt",
+        ]
+        return next((p for p in candidates if p.is_file()), None)
+
+    @staticmethod
+    def _parse_voc(path: Path) -> tuple[np.ndarray, np.ndarray]:
+        root = ET.parse(path).getroot()
+        boxes, labels = [], []
+        for obj in root.findall("object"):
+            name = (obj.findtext("name") or "").strip().lower()
+            if name not in CLASS_TO_ID:
+                continue
+            box = obj.find("bndbox")
+            if box is None:
+                continue
+            values = [float(box.findtext(key, "0")) for key in ("xmin", "ymin", "xmax", "ymax")]
+            if values[2] > values[0] and values[3] > values[1]:
+                boxes.append(values)
+                labels.append(CLASS_TO_ID[name])
+        return np.asarray(boxes, dtype=np.float32).reshape(-1, 4), np.asarray(labels, dtype=np.int64)
+
+    @staticmethod
+    def _parse_yolo(path: Path, image_shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+        h, w = image_shape
+        boxes, labels = [], []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            values = line.split()
+            if len(values) < 5:
+                continue
+            cls, cx, cy, bw, bh = map(float, values[:5])
+            if int(cls) not in range(len(CLASS_NAMES)):
+                continue
+            if max(cx, cy, bw, bh) <= 1.5:
+                cx, cy, bw, bh = cx * w, cy * h, bw * w, bh * h
+            boxes.append([cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2])
+            labels.append(int(cls))
+        return np.asarray(boxes, dtype=np.float32).reshape(-1, 4), np.asarray(labels, dtype=np.int64)
 
     def __len__(self) -> int:
-        raise NotImplementedError("Cần được Sơn cài đặt __len__.")
+        return len(self.items)
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Trả về ảnh (3, 608, 608) và targets (N, 5) gồm [class, cx, cy, w, h].
-        """
-        raise NotImplementedError("Cần được Sơn cài đặt __getitem__.")
+    def __getitem__(self, index: int):
+        path = self.items[index]
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise OSError(f"Unable to read image: {path}")
+        annotation = self._annotation_path(path)
+        if annotation is None:
+            boxes = np.empty((0, 4), dtype=np.float32)
+            labels = np.empty((0,), dtype=np.int64)
+        elif annotation.suffix.lower() == ".xml":
+            boxes, labels = self._parse_voc(annotation)
+        else:
+            boxes, labels = self._parse_yolo(annotation, image.shape[:2])
+        image_tensor, boxes_tensor, labels_tensor = self.transform(image, boxes, labels)
+        targets = torch.cat([labels_tensor.float().unsqueeze(1), boxes_tensor], dim=1)
+        return image_tensor, targets, str(path)
 
 
-def yolo_collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Gom cụm các phần tử từ dataset thành batch, xử lý kích thước bounding box thay đổi động.
-    
-    Returns:
-        images: (B, 3, 608, 608)
-        targets: (M, 6) dạng [batch_idx, class_id, cx, cy, w, h]
-    """
-    raise NotImplementedError("Cần được Sơn cài đặt yolo_collate_fn.")
+def detection_collate(batch):
+    images, targets, paths = zip(*batch)
+    images = torch.stack(images)
+    merged = []
+    for batch_index, target in enumerate(targets):
+        if target.numel():
+            batch_column = torch.full((target.shape[0], 1), batch_index, dtype=target.dtype)
+            merged.append(torch.cat([batch_column, target], dim=1))
+    merged_targets = torch.cat(merged, dim=0) if merged else torch.zeros((0, 6), dtype=torch.float32)
+    return images, merged_targets, list(paths)
 
 
-def build_dataloader(
-    split_file: str | Path,
-    batch_size: int = 16,
-    img_size: int = 608,
-    is_train: bool = True,
-    num_workers: int = 4
-) -> DataLoader:
-    """
-    Tạo DataLoader chuẩn hóa cho quá trình Train / Val / Test.
-    """
-    raise NotImplementedError("Cần được Sơn cài đặt build_dataloader.")
+def build_dataloader(data_root: str | Path, split_file: str | Path, image_size: int,
+                     batch_size: int, train: bool, workers: int = 0,
+                     limit: int | None = None) -> DataLoader:
+    dataset = SHWDDataset(data_root, split_file, image_size=image_size, train=train, limit=limit)
+    return DataLoader(
+        dataset, batch_size=batch_size, shuffle=train, num_workers=workers,
+        pin_memory=torch.cuda.is_available(), collate_fn=detection_collate,
+        persistent_workers=workers > 0,
+    )
 
 
 if __name__ == "__main__":
-    print("[TODO] datasets/shwd.py: Chạy unit test nạp thử 1 batch từ DataLoader.")
+    root = Path("dataset")
+    split = Path("datasets/splits/train.txt")
+    if root.exists() and split.exists():
+        dataset = SHWDDataset(root, split, image_size=608, limit=1)
+        image, target, path = dataset[0]
+        print(f"shwd.py: PASS {path} {tuple(image.shape)} {tuple(target.shape)}")
