@@ -46,7 +46,7 @@ def _set_backbone_trainable(model: nn.Module, trainable: bool) -> None:
 def _autocast(device: torch.device, enabled: bool):
     if not enabled:
         return nullcontext()
-    return torch.cuda.amp.autocast()
+    return torch.autocast(device_type="cuda", dtype=torch.float16)
 
 
 def run_epoch(model: nn.Module, loader, criterion: ComputeLoss, optimizer=None,
