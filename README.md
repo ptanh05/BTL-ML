@@ -14,6 +14,7 @@ utils/         CIoU/SIoU, metrics, plots, checkpoint and Colab helpers
 train.py       two-stage freeze/unfreeze training
 eval.py        mAP, precision/recall/F1, FPS and benchmark CSV
 detect.py      image/directory inference and visualisation
+run_ablation.py sequential Model-1..6 training and comparison report
 tests/         smoke tests for tensor interfaces and numerical stability
 ```
 
@@ -83,3 +84,19 @@ python detect.py --weights weights/model6/model_6_best.pth \
 Model-3/4 mAP values in the source paper contain an internal arithmetic
 discrepancy; the implementation reports measured values rather than forcing
 the paper's target numbers.
+
+## Sequential ablation run
+
+To train and evaluate every model in order, with a separate checkpoint and
+history directory for each model:
+
+```bash
+python run_ablation.py --device cuda \
+  --output-root weights/ablation \
+  --results results/ablation
+```
+
+The runner writes `model_1.json` through `model_6.json`, one
+`history.json` per model, `ablation_summary.csv`, and
+`ablation_report.md`. Use `--dry-run --limit 8 --no-fps` first to validate the
+whole sequence without starting a full 200-epoch experiment.
