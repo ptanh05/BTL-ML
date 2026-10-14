@@ -20,14 +20,21 @@ model_id: "model_3"
 model_name: "YOLOv4-PPLCNet"
 
 architecture:
-  backbone: "pplcnet"         # Thay thế bằng PP-LCNet nhẹ
+  backbone: "pplcnet"
+  pplcnet_layout: "paper"
+  pplcnet_se_blocks: 2  # Assumption: SE only in the last two blocks; paper omits exact count         # Thay thế bằng PP-LCNet nhẹ
   dsc: true
   ca: false
   neck: "panet"
-  neck_channels: [128, 256, 512]
+  neck_channels: [256, 512, 1024]  # Preserve YOLOv4 neck/head widths across backbone ablation
+  anchor_iou_threshold: 0.213  # YOLOv4 convention; not specified by Sensors paper
+  ignore_iou_threshold: 0.7
   loss: "ciou"
 
 training:
+  protocol: "paper"
+  amp: false  # FP32 default; optional AMP is an implementation choice
+  backbone_weights: null  # Supply compatible pretrained weights for paper training
   epochs_freeze: 50
   lr_freeze: 0.001
   batch_size_freeze: 16

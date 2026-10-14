@@ -26,9 +26,14 @@ architecture:
   ca: false                   # No Coordinate Attention
   neck: "panet"               # Standard PANet
   neck_channels: [256, 512, 1024]
+  anchor_iou_threshold: 0.213  # YOLOv4 convention; not specified by Sensors paper
+  ignore_iou_threshold: 0.7
   loss: "ciou"                # Complete IoU Loss
 
 training:
+  protocol: "paper"
+  amp: false  # FP32 default; optional AMP is an implementation choice
+  backbone_weights: null  # Supply compatible pretrained weights for paper training
   epochs_freeze: 50           # Giai đoạn 1: Freeze backbone
   lr_freeze: 0.001
   batch_size_freeze: 16

@@ -6,16 +6,26 @@ import torch
 from torch import nn
 
 
+def activation(name: str) -> nn.Module:
+    if name == "mish":
+        return nn.Mish()
+    if name == "leaky":
+        return nn.LeakyReLU(0.1, inplace=True)
+    if name == "hardswish":
+        return nn.Hardswish(inplace=True)
+    raise ValueError(f"Unsupported activation: {name}")
+
+
 class ConvBnAct(nn.Module):
-    """Convolution followed by batch normalization and Hardswish."""
+    """Convolution followed by batch normalization and a selected activation."""
 
     def __init__(self, c1: int, c2: int, k: int = 1, s: int = 1,
-                 p: int | None = None, groups: int = 1) -> None:
+                 p: int | None = None, groups: int = 1, act: str = "hardswish") -> None:
         super().__init__()
         padding = k // 2 if p is None else p
         self.conv = nn.Conv2d(c1, c2, k, s, padding, groups=groups, bias=False)
         self.bn = nn.BatchNorm2d(c2)
-        self.act = nn.Hardswish(inplace=True)
+        self.act = activation(act)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.act(self.bn(self.conv(x)))
@@ -24,26 +34,28 @@ class ConvBnAct(nn.Module):
 class DSConv(nn.Module):
     """Depthwise-separable 3x3 convolution used in Models 2-6."""
 
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 1) -> None:
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1,
+                 act: str = "leaky") -> None:
         super().__init__()
         self.depthwise = nn.Conv2d(
             in_channels, in_channels, 3, stride, 1,
             groups=in_channels, bias=False,
         )
         self.bn1 = nn.BatchNorm2d(in_channels)
-        self.act1 = nn.Hardswish(inplace=True)
+        self.act1 = activation(act)
         self.pointwise = nn.Conv2d(in_channels, out_channels, 1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
-        self.act2 = nn.Hardswish(inplace=True)
+        self.act2 = activation(act)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.act1(self.bn1(self.depthwise(x)))
         return self.act2(self.bn2(self.pointwise(x)))
 
 
-def conv3x3(c1: int, c2: int, stride: int = 1, dsc: bool = True) -> nn.Module:
+def conv3x3(c1: int, c2: int, stride: int = 1, dsc: bool = True,
+            act: str = "leaky") -> nn.Module:
     """Factory for the standard or depthwise-separable 3x3 convolution."""
-    return DSConv(c1, c2, stride) if dsc else ConvBnAct(c1, c2, k=3, s=stride)
+    return DSConv(c1, c2, stride, act) if dsc else ConvBnAct(c1, c2, k=3, s=stride, act=act)
 
 
 class SPP(nn.Module):
@@ -56,7 +68,7 @@ class SPP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.cat([x, *(pool(x) for pool in self.pools)], dim=1)
+        return torch.cat([*(pool(x) for pool in reversed(self.pools)), x], dim=1)
 
 
 if __name__ == "__main__":

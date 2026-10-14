@@ -1,4 +1,4 @@
-"""Compact CSPDarknet53-compatible feature extractor for baseline models."""
+"""YOLOv4 CSPDarknet53 backbone: Mish and CSP depths (1, 2, 8, 8, 4)."""
 
 from __future__ import annotations
 
@@ -15,11 +15,12 @@ except ImportError:  # direct execution: python models/cspdarknet.py
 
 
 class Bottleneck(nn.Module):
-    def __init__(self, channels: int, shortcut: bool = True) -> None:
+    def __init__(self, channels: int, shortcut: bool = True,
+                 hidden_channels: int | None = None) -> None:
         super().__init__()
-        hidden = max(channels // 2, 1)
-        self.cv1 = ConvBnAct(channels, hidden, 1)
-        self.cv2 = ConvBnAct(hidden, channels, 3)
+        hidden = hidden_channels if hidden_channels is not None else channels
+        self.cv1 = ConvBnAct(channels, hidden, 1, act="mish")
+        self.cv2 = ConvBnAct(hidden, channels, 3, act="mish")
         self.shortcut = shortcut
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -28,18 +29,22 @@ class Bottleneck(nn.Module):
 
 
 class CSPStage(nn.Module):
-    def __init__(self, c1: int, c2: int, blocks: int) -> None:
+    def __init__(self, c1: int, c2: int, blocks: int, first: bool = False) -> None:
         super().__init__()
-        self.down = ConvBnAct(c1, c2, 3, 2) if c1 != c2 else nn.Identity()
-        hidden = max(c2 // 2, 1)
-        self.left = ConvBnAct(c2, hidden, 1)
-        self.right = ConvBnAct(c2, hidden, 1)
-        self.blocks = nn.Sequential(*(Bottleneck(hidden) for _ in range(blocks)))
-        self.fuse = ConvBnAct(hidden * 2, c2, 1)
+        self.down = ConvBnAct(c1, c2, 3, 2, act="mish")
+        hidden = c2 if first else c2 // 2
+        self.left = ConvBnAct(c2, hidden, 1, act="mish")
+        self.right = ConvBnAct(c2, hidden, 1, act="mish")
+        self.blocks = nn.Sequential(*(
+            Bottleneck(hidden, hidden_channels=c2 // 2 if first else hidden)
+            for _ in range(blocks)
+        ))
+        self.post = ConvBnAct(hidden, hidden, 1, act="mish")
+        self.fuse = ConvBnAct(hidden * 2, c2, 1, act="mish")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.down(x)
-        return self.fuse(torch.cat([self.blocks(self.left(x)), self.right(x)], dim=1))
+        return self.fuse(torch.cat([self.post(self.blocks(self.left(x))), self.right(x)], dim=1))
 
 
 class CSPDarknet53(nn.Module):
@@ -47,14 +52,12 @@ class CSPDarknet53(nn.Module):
 
     def __init__(self, pretrained_path: str | Path | None = None) -> None:
         super().__init__()
-        self.stem = ConvBnAct(3, 32, 3, 2)
-        self.stage1 = CSPStage(32, 64, 1)
-        self.stage2 = CSPStage(64, 128, 1)
-        # Keep the first detection feature at stride 8 (76x76), then project
-        # the CSP features to the YOLOv4 C3 width.
-        self.stage3 = nn.Sequential(CSPStage(128, 128, 2), ConvBnAct(128, 256, 1))
-        self.stage4 = CSPStage(256, 512, 2)
-        self.stage5 = CSPStage(512, 1024, 2)
+        self.stem = ConvBnAct(3, 32, 3, 1, act="mish")
+        self.stage1 = CSPStage(32, 64, 1, first=True)
+        self.stage2 = CSPStage(64, 128, 2)
+        self.stage3 = CSPStage(128, 256, 8)
+        self.stage4 = CSPStage(256, 512, 8)
+        self.stage5 = CSPStage(512, 1024, 4)
         if pretrained_path:
             self.load_pretrained(pretrained_path)
 
@@ -68,7 +71,10 @@ class CSPDarknet53(nn.Module):
     def load_pretrained(self, path: str | Path) -> tuple[list[str], list[str]]:
         payload = torch.load(path, map_location="cpu")
         state = payload.get("state_dict", payload.get("model", payload)) if isinstance(payload, dict) else payload
-        missing, unexpected = self.load_state_dict(state, strict=False)
+        if any(key.startswith("backbone.") for key in state):
+            state = {key.removeprefix("backbone."): value for key, value in state.items()
+                     if key.startswith("backbone.")}
+        missing, unexpected = self.load_state_dict(state, strict=True)
         return list(missing), list(unexpected)
 
 

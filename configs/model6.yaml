@@ -22,17 +22,24 @@ model_name: "Improved-YOLOv4-Complete"
 
 architecture:
   backbone: "pplcnet"
+  pplcnet_layout: "paper"
+  pplcnet_se_blocks: 2  # Assumption: SE only in the last two blocks; paper omits exact count
   dsc: true
   ca: true
   ca_reduction: 32
   neck: "pb"                  # PB Module (SPP + PANet + BiFPN)
-  neck_channels: [128, 256, 512]
-  bifpn_channels: 128
+  neck_channels: [256, 512, 1024]  # Preserve YOLOv4 neck/head widths across backbone ablation
+  bifpn_channels: null  # Preserve per-level widths (128, 256, 512)
+  anchor_iou_threshold: 0.213  # YOLOv4 convention; not specified by Sensors paper
+  ignore_iou_threshold: 0.7
   loss: "siou"                # Cải tiến cốt lõi: SIoU Loss
   siou_theta: 4.0             # Tham số hình dạng Shape cost (theta)
   siou_eps: 1e-7
 
 training:
+  protocol: "paper"
+  amp: false  # FP32 default; optional AMP is an implementation choice
+  backbone_weights: null  # Supply compatible pretrained weights for paper training
   epochs_freeze: 50
   lr_freeze: 0.001
   batch_size_freeze: 16

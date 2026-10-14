@@ -42,7 +42,8 @@ class YOLOv4Variant(nn.Module):
         self.cfg = arch
         self.num_classes = num_classes
         if arch.get("backbone", "pplcnet") == "pplcnet":
-            self.backbone = PPLCNet()
+            self.backbone = PPLCNet(layout=arch.get("pplcnet_layout", "paper"),
+                                    se_blocks=int(arch.get("pplcnet_se_blocks", 2)))
             channels = (128, 256, 512)
         elif arch.get("backbone") == "cspdarknet53":
             self.backbone = CSPDarknet53()
@@ -50,16 +51,20 @@ class YOLOv4Variant(nn.Module):
         else:
             raise ValueError(f"Unsupported backbone: {arch.get('backbone')}")
         self.use_ca = bool(arch.get("ca", False))
+        neck_channels = tuple(arch.get("neck_channels", (256, 512, 1024)))
         self.ca = nn.ModuleList([
             CoordAtt(c, reduction=int(arch.get("ca_reduction", 32))) for c in channels
         ]) if self.use_ca else nn.ModuleList()
         dsc = bool(arch.get("dsc", True))
         if arch.get("neck", "panet") == "pb":
             self.neck = PBModule(
-                channels, bi_ch=int(arch.get("bifpn_channels", 128)), dsc=dsc
+                channels, bi_ch=(int(arch["bifpn_channels"]) if arch.get("bifpn_channels") is not None else None), dsc=dsc,
+                neck_channels=neck_channels,
             )
+        elif arch.get("neck", "panet") == "panet":
+            self.neck = PANet(channels, dsc=dsc, neck_channels=neck_channels)
         else:
-            self.neck = PANet(channels, dsc=dsc)
+            raise ValueError(f"Unsupported neck: {arch.get('neck')}")
         self.head = YOLOHead(self.neck.out_channels, num_classes, 3, dsc=dsc)
 
     def forward(self, x: torch.Tensor) -> list[torch.Tensor]:

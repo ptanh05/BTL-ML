@@ -37,32 +37,32 @@ drive.mount('/content/drive')
 
 ### Bước 3: Tăng tốc I/O - Giải nén dữ liệu vào SSD cục bộ
 > **Quan trọng**: Tuyệt đối không đọc trực tiếp 7,004 ảnh từ Google Drive vì sẽ nghẽn I/O dẫn đến GPU bị nhàn rỗi (GPU utilization < 20%).
-```python
-import zipfile, os
-
-zip_path = '/content/drive/MyDrive/BTL_ML/Dataset_Split-20261005T022535Z-1-001.zip'
-extract_path = '/content/dataset'
-
-if not os.path.exists(extract_path):
-    os.makedirs(extract_path, exist_ok=True)
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(extract_path)
-    print(">> Đã giải nén xong dữ liệu vào SSD cục bộ /content/dataset!")
-```
+Chạy cell chuẩn bị dữ liệu trong `train_colab.ipynb`. Cell này xử lý cả archive
+có thư mục gốc `dataset/`, kiểm tra annotations, tạo split và sinh
+`configs/dataset_colab.yaml` trỏ tới `/content/dataset`. Dùng file cấu hình này
+cho cả train, resume, eval và detect để các lệnh đọc cùng một bộ dữ liệu.
 
 ### Bước 4: Khởi chạy Huấn luyện 2 Giai đoạn
 ```bash
 # Ví dụ cho Tú huấn luyện Model-6:
-!python train.py --config configs/model6.yaml --data configs/dataset.yaml
+!python train.py --config configs/model6.yaml --data configs/dataset_colab.yaml --backbone-weights /content/drive/MyDrive/BTL_ML/pretrained/pplcnet_paper.pth --output /content/drive/MyDrive/BTL_ML/checkpoints/model_6
 
 # Trường hợp bị ngắt kết nối (Colab Timeout), chạy resume từ Drive:
-!python train.py --config configs/model6.yaml --resume /content/drive/MyDrive/BTL_ML/checkpoints/model6_last.pth
+!python train.py --config configs/model6.yaml --data configs/dataset_colab.yaml --resume /content/drive/MyDrive/BTL_ML/checkpoints/model_6/last.pth
 ```
 
 ---
 
 ## 3. Quy chuẩn sao lưu và bàn giao trọng số (DoD M4)
-1. Tự động lưu checkpoint `last.pth` sau mỗi 10 epoch vào Google Drive chung.
-2. Khi hoàn thành đủ 200 epochs, sao lưu file `modelX_best.pth` về thư mục Google Drive chung của nhóm:
+Chế độ `paper` yêu cầu pretrained PyTorch khớp backbone và SHWD đã sửa nhãn,
+để chạy 50 epoch freeze rồi 150 epoch unfreeze. Dataset 7.581 ảnh đang có trong
+repo không phải bản 7.004 ảnh của bài báo. Dùng `--dry-run` để kiểm tra thực thi,
+hoặc `--from-scratch` để train thử trên dữ liệu hiện có; kết quả được ghi là
+`smoke`/`development`. Khi resume chế độ development, giữ `--from-scratch`.
+Khi resume và không truyền `--output`, checkpoint
+mới được lưu cạnh checkpoint đang đọc trên Drive.
+
+1. Tự động lưu checkpoint `last.pth` sau mỗi 10 epoch, khi validation loss cải thiện và ở epoch cuối vào thư mục `--output`.
+2. Khi hoàn thành đủ 200 epochs, sao lưu file `model_6_best.pth` (hoặc ID model tương ứng) về thư mục Google Drive chung của nhóm:
    `MyDrive/BTL_ML_Shared_Weights/`
 3. Bàn giao file trọng số cho **Tú & Sơn** để chạy script `eval.py` phục vụ nghiệm thu **Mốc 5 (M5)**.

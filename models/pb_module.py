@@ -19,30 +19,41 @@ def _resize(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
 def make_n_conv(c_in: int, c_out: int, n: int, dsc: bool = True) -> nn.Sequential:
     layers: list[nn.Module] = []
     for i in range(n):
-        layers.append(conv3x3(c_in if i == 0 else c_out, c_out, dsc=dsc))
+        # YOLOv4 alternates 1x1 reduction and 3x3 expansion.
+        in_ch = c_in if i == 0 else (c_out * 2 if i % 2 == 0 else c_out)
+        if i % 2 == 0:
+            layers.append(ConvBnAct(in_ch, c_out, 1, act="leaky"))
+        else:
+            layers.append(conv3x3(in_ch, c_out * 2, dsc=dsc))
     return nn.Sequential(*layers)
 
 
 class PANet(nn.Module):
     """SPP + top-down and bottom-up path aggregation."""
 
-    def __init__(self, ch: tuple[int, int, int] = (128, 256, 512), dsc: bool = True) -> None:
+    def __init__(self, ch: tuple[int, int, int] = (128, 256, 512), dsc: bool = True,
+                 neck_channels: tuple[int, int, int] | None = None) -> None:
         super().__init__()
-        c3, c4, c5 = ch
+        widths = tuple(neck_channels or (256, 512, 1024))
+        if len(widths) != 3 or any(c < 2 or c % 2 for c in widths):
+            raise ValueError("neck_channels must contain three positive even widths")
+        c3, c4, c5 = widths
         h3, h4, h5 = c3 // 2, c4 // 2, c5 // 2
-        self.c5_pre = make_n_conv(c5, h5, 3, dsc)
+        # Backbone channel counts are independent from PANet internal widths.
+        # Changing backbone does not silently halve the whole neck/head.
+        self.c5_pre = make_n_conv(ch[2], h5, 3, dsc)
         self.spp = SPP()
         self.c5_post = make_n_conv(h5 * 4, h5, 3, dsc)
-        self.p4_lat = ConvBnAct(c4, h4, 1)
-        self.p5_red = ConvBnAct(h5, h4, 1)
-        self.p4_td = make_n_conv(h4 * 2, h4, 3, dsc)
-        self.p3_lat = ConvBnAct(c3, h3, 1)
-        self.p4_red = ConvBnAct(h4, h3, 1)
-        self.p3_td = make_n_conv(h3 * 2, h3, 3, dsc)
+        self.p4_lat = ConvBnAct(ch[1], h4, 1, act="leaky")
+        self.p5_red = ConvBnAct(h5, h4, 1, act="leaky")
+        self.p4_td = make_n_conv(h4 * 2, h4, 5, dsc)
+        self.p3_lat = ConvBnAct(ch[0], h3, 1, act="leaky")
+        self.p4_red = ConvBnAct(h4, h3, 1, act="leaky")
+        self.p3_td = make_n_conv(h3 * 2, h3, 5, dsc)
         self.down3 = conv3x3(h3, h4, 2, dsc)
-        self.p4_bu = make_n_conv(h4 * 2, h4, 3, dsc)
+        self.p4_bu = make_n_conv(h4 * 2, h4, 5, dsc)
         self.down4 = conv3x3(h4, h5, 2, dsc)
-        self.p5_bu = make_n_conv(h5 * 2, h5, 3, dsc)
+        self.p5_bu = make_n_conv(h5 * 2, h5, 5, dsc)
         self.out_channels = (h3, h4, h5)
 
     def forward(self, p3: torch.Tensor, p4: torch.Tensor, p5: torch.Tensor):
@@ -67,26 +78,34 @@ class WeightedAdd(nn.Module):
 
 
 class BiFPN(nn.Module):
-    def __init__(self, in_ch: tuple[int, int, int], ch: int = 128, dsc: bool = True) -> None:
+    """Figure 4: fine-to-coarse first, then coarse-to-fine with middle residual."""
+
+    def __init__(self, in_ch: tuple[int, int, int], ch: int | None = None, dsc: bool = True) -> None:
         super().__init__()
-        self.proj = nn.ModuleList([ConvBnAct(c, ch, 1) for c in in_ch])
-        self.w_td4, self.w_o3 = WeightedAdd(2), WeightedAdd(2)
+        channels = (ch, ch, ch) if ch is not None else in_ch
+        self.proj = nn.ModuleList([
+            ConvBnAct(src, dst, 1, act="leaky") if src != dst else nn.Identity()
+            for src, dst in zip(in_ch, channels)
+        ])
+        c3, c4, c5 = channels
+        self.down3 = conv3x3(c3, c4, 2, dsc)
+        self.down4 = conv3x3(c4, c5, 2, dsc)
+        self.up5 = ConvBnAct(c5, c4, 1, act="leaky")
+        self.up4 = ConvBnAct(c4, c3, 1, act="leaky")
+        self.w_mid4, self.w_o3 = WeightedAdd(2), WeightedAdd(2)
         self.w_o4, self.w_o5 = WeightedAdd(3), WeightedAdd(2)
-        self.c_td4 = conv3x3(ch, ch, dsc=dsc)
-        self.c_o3 = conv3x3(ch, ch, dsc=dsc)
-        self.c_o4 = conv3x3(ch, ch, dsc=dsc)
-        self.c_o5 = conv3x3(ch, ch, dsc=dsc)
-        self.down = nn.MaxPool2d(2, 2)
-        self.out_channels = (ch, ch, ch)
+        self.c_mid4 = conv3x3(c4, c4, dsc=dsc)
+        self.c_o3 = conv3x3(c3, c3, dsc=dsc)
+        self.c_o4 = conv3x3(c4, c4, dsc=dsc)
+        self.c_o5 = conv3x3(c5, c5, dsc=dsc)
+        self.out_channels = channels
 
     def forward(self, x3: torch.Tensor, x4: torch.Tensor, x5: torch.Tensor):
         x3, x4, x5 = [m(x) for m, x in zip(self.proj, (x3, x4, x5))]
-        td4 = self.c_td4(self.w_td4([x4, _resize(x5, x4)]))
-        o3 = self.c_o3(self.w_o3([x3, _resize(td4, x3)]))
-        down_o3 = F.max_pool2d(o3, kernel_size=2, stride=2)
-        o4 = self.c_o4(self.w_o4([x4, td4, _resize(down_o3, x4)]))
-        down_o4 = F.max_pool2d(o4, kernel_size=2, stride=2)
-        o5 = self.c_o5(self.w_o5([x5, _resize(down_o4, x5)]))
+        mid4 = self.c_mid4(self.w_mid4([x4, _resize(self.down3(x3), x4)]))
+        o5 = self.c_o5(self.w_o5([x5, _resize(self.down4(mid4), x5)]))
+        o4 = self.c_o4(self.w_o4([x4, mid4, _resize(self.up5(o5), x4)]))
+        o3 = self.c_o3(self.w_o3([x3, _resize(self.up4(o4), x3)]))
         return o3, o4, o5
 
 
@@ -94,9 +113,10 @@ class PBModule(nn.Module):
     """PB neck = PANet followed by a three-level weighted BiFPN."""
 
     def __init__(self, ch: tuple[int, int, int] = (128, 256, 512),
-                 bi_ch: int = 128, dsc: bool = True) -> None:
+                 bi_ch: int | None = None, dsc: bool = True,
+                 neck_channels: tuple[int, int, int] | None = None) -> None:
         super().__init__()
-        self.panet = PANet(ch, dsc=dsc)
+        self.panet = PANet(ch, dsc=dsc, neck_channels=neck_channels)
         self.bifpn = BiFPN(self.panet.out_channels, ch=bi_ch, dsc=dsc)
         self.out_channels = self.bifpn.out_channels
 
@@ -110,6 +130,6 @@ if __name__ == "__main__":
     p5 = torch.randn(2, 512, 19, 19)
     out = PBModule() (p3, p4, p5)
     assert [tuple(t.shape) for t in out] == [
-        (2, 128, 76, 76), (2, 128, 38, 38), (2, 128, 19, 19)
+        (2, 128, 76, 76), (2, 256, 38, 38), (2, 512, 19, 19)
     ]
     print("pb_module.py: PASS")

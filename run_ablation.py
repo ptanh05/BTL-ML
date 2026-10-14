@@ -56,7 +56,7 @@ def write_report(path: Path, rows: list[dict], args: argparse.Namespace) -> None
         "",
         f"- Generated: {datetime.now(timezone.utc).isoformat()}",
         f"- Device: `{args.device}`",
-        f"- Epoch override: `{args.epochs or 'config (50 freeze + 150 unfreeze)'}`",
+        f"- Epoch override: `{args.epochs or 'config total (freeze only with pretrained backbone)'}`",
         f"- Sample limit: `{args.limit or (8 if args.dry_run else 'full split')}`",
         "",
         "| Model | Status | mAP (%) | Target (%) | Delta (pp) | Precision (%) | Recall (%) | F1 (%) | FPS | Size (MB) |",
@@ -88,6 +88,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, help="Limit train and test samples")
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true", help="Two epochs with a small sample limit")
+    parser.add_argument("--from-scratch", action="store_true", help="Development run, not the paper transfer-learning experiment")
+    parser.add_argument("--backbone-weights-dir", help="Directory with cspdarknet53.pth and pplcnet_paper.pth")
     parser.add_argument("--no-fps", action="store_true")
     parser.add_argument("--skip-existing", action="store_true", help="Reuse existing best checkpoints")
     parser.add_argument("--continue-on-error", action="store_true")
@@ -119,10 +121,15 @@ def run() -> list[dict]:
         print(f"\n===== {model_id}: {config_path.name} =====")
         try:
             if not (args.skip_existing and checkpoint.exists()):
+                backbone_weights = None
+                if args.backbone_weights_dir:
+                    filename = "cspdarknet53.pth" if model_number <= 2 else "pplcnet_paper.pth"
+                    backbone_weights = resolve(args.backbone_weights_dir) / filename
                 training = train_model(
                     config_path=config_path, data_path=resolve(args.data),
                     device_name=str(device), output=model_output, epochs=args.epochs,
                     limit=args.limit, workers=args.workers, dry_run=args.dry_run,
+                    backbone_weights=backbone_weights, from_scratch=args.from_scratch,
                 )
             else:
                 training = {"checkpoint": str(checkpoint), "model_id": model_id, "status": "reused"}

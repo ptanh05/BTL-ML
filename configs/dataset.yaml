@@ -8,7 +8,9 @@
 #   - Thiết lập các siêu tham số đầu vào (kích thước ảnh 608x608, 9 cụm anchor).
 #
 # LƯU Ý KỸ THUẬT:
-#   - Bộ dữ liệu SHWD đã làm sạch gồm 7,004 ảnh (7,709 nhãn hat, 101,174 nhãn person).
+#   - Bài báo dùng SHWD đã sửa nhãn: 7,004 ảnh, 7,709 hat, 101,174 person.
+#   - Dataset hiện có trong repo là bản gốc: 7,581 ảnh, 9,044 hat, 111,514 person.
+#   - Không coi dữ liệu hiện tại là bộ đã làm sạch của tác giả.
 #   - Khi chạy trên Google Colab, giải nén về SSD cục bộ `/content/dataset` để tránh nghẽn I/O Google Drive.
 # ==============================================================================
 
@@ -18,7 +20,7 @@ data_dir: "dataset"                    # Đường dẫn local đã giải nén
 annotations_dir: "dataset/annotations" # Thư mục chứa 7,581 file Pascal VOC XML
 colab_data_dir: "/content/dataset"     # Đường dẫn trên Colab SSD
 
-# Đường dẫn danh sách file chia tập (80% train / 10% val / 10% test)
+# Split hiện có: 5,457 train / 607 val / 1,517 test; bài báo không công bố split/seed.
 train_split: "datasets/splits/train.txt"
 val_split: "datasets/splits/val.txt"
 test_split: "datasets/splits/test.txt"

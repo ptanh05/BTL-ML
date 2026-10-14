@@ -26,7 +26,7 @@ def _resolve(path: str | Path) -> Path:
 def _load(model, path: Path, device: torch.device) -> None:
     payload = torch.load(path, map_location=device)
     state = payload.get("model", payload.get("state_dict", payload)) if isinstance(payload, dict) else payload
-    model.load_state_dict(state, strict=False)
+    model.load_state_dict(state, strict=True)
 
 
 def _image_files(source: Path) -> list[Path]:
